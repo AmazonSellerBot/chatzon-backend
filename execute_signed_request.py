@@ -3,8 +3,8 @@ import hmac
 import requests
 import datetime
 import os
+import json
 
-# Get SP-API credentials from environment variables
 AWS_ACCESS_KEY = os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
 ROLE_ARN = os.getenv("SPAPI_ROLE_ARN")
@@ -14,7 +14,6 @@ REFRESH_TOKEN = os.getenv("SPAPI_REFRESH_TOKEN")
 REGION = "us-east-1"
 ENDPOINT = "https://sellingpartnerapi-na.amazon.com"
 
-# LWA: get access token
 def get_access_token():
     url = "https://api.amazon.com/auth/o2/token"
     payload = {
@@ -26,25 +25,33 @@ def get_access_token():
     headers = {
         "Content-Type": "application/x-www-form-urlencoded"
     }
-    response = requests.post(url, data=payload, headers=headers)
-    response.raise_for_status()
-    return response.json()["access_token"]
 
-# Main SP-API signed request method
+    print("\n🔍 Sending LWA token request with:")
+    print("URL:", url)
+    print("Payload:", payload)
+
+    response = requests.post(url, data=payload, headers=headers)
+
+    try:
+        response.raise_for_status()
+        print("✅ LWA token acquired")
+        return response.json()["access_token"]
+    except requests.exceptions.HTTPError as e:
+        print("❌ LWA token request failed:", response.text)
+        raise e
+
 def execute_signed_request(method, endpoint, body=None, query_string=None):
     access_token = get_access_token()
     service = "execute-api"
     host = "sellingpartnerapi-na.amazon.com"
-    amz_target = None  # Not needed unless calling old-style endpoints
 
     t = datetime.datetime.utcnow()
     amz_date = t.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = t.strftime("%Y%m%d")  # Date w/o time for credential scope
+    date_stamp = t.strftime("%Y%m%d")
 
     canonical_uri = endpoint
     canonical_querystring = query_string or ""
     request_parameters = body or {}
-
     payload = "" if method == "GET" else json.dumps(request_parameters)
     payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -95,6 +102,10 @@ def execute_signed_request(method, endpoint, body=None, query_string=None):
     }
 
     url = ENDPOINT + canonical_uri
+    print("\n📤 Sending signed SP-API request to:", url)
+    print("Headers:", headers)
+    print("Payload:", payload)
+
     response = requests.request(method, url, headers=headers, data=payload)
     response.raise_for_status()
     return response.json()
