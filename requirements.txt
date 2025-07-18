@@ -1,6 +1,2 @@
-fastapi
-uvicorn
-requests
-python-dotenv
-boto3
-botocore
+fastapi==0.110.0
+uvicorn==0.29.0
