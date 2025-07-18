@@ -115,4 +115,3 @@ def update_price(payload: PriceUpdateRequest):
 
     feed_response = execute_signed_request("/feeds/2021-06-30/feeds", feed_payload, access_token)
     return {"message": "Submitted price update feed", "feedId": feed_response.get("feedId")}
-
