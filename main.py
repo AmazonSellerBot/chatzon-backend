@@ -1,111 +1,117 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-import uvicorn
 import os
 import requests
-import json
 import datetime
 import hashlib
 import hmac
+import json
 
 app = FastAPI()
 
 @app.get("/")
-async def root():
+def root():
     return {"message": "ChatZon Backend is running 🚀"}
 
 class PriceUpdateRequest(BaseModel):
     asin: str
-    sku: str
-    marketplace_id: str
     price: float
 
-@app.post("/update-price")
-async def update_price(req: PriceUpdateRequest):
-    # Step 1: Auth
-    lwa_refresh_token = os.environ.get("LWA_REFRESH_TOKEN")
-    lwa_client_id = os.environ.get("LWA_CLIENT_ID")
-    lwa_client_secret = os.environ.get("LWA_CLIENT_SECRET")
-    access_token = get_access_token(lwa_refresh_token, lwa_client_id, lwa_client_secret)
+def get_access_token():
+    lwa_client_id = os.environ['LWA_CLIENT_ID']
+    lwa_client_secret = os.environ['LWA_CLIENT_SECRET']
+    refresh_token = os.environ['LWA_REFRESH_TOKEN']
 
-    # Step 2: Signed request
-    endpoint = f"/listings/2021-08-01/items/{req.sku}/pricing"
-    body = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/standard_price",
-            "value": [{
-                "currency": "USD",
-                "amount": req.price
-            }]
-        }]
-    }
-
-    headers = sign_request(
-        method="PATCH",
-        endpoint=endpoint,
-        access_token=access_token,
-        body=json.dumps(body)
-    )
-
-    url = f"https://sellingpartnerapi-na.amazon.com{endpoint}?marketplaceIds={req.marketplace_id}"
-    response = requests.patch(url, headers=headers, data=json.dumps(body))
-
-    return {
-        "status_code": response.status_code,
-        "response": response.json()
-    }
-
-def get_access_token(refresh_token, client_id, client_secret):
     url = "https://api.amazon.com/auth/o2/token"
-    payload = {
+    data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
-        "client_id": client_id,
-        "client_secret": client_secret
-    }
-    r = requests.post(url, data=payload)
-    return r.json()["access_token"]
-
-def sign_request(method, endpoint, access_token, body=""):
-    import boto3
-    from botocore.auth import SigV4Auth
-    from botocore.awsrequest import AWSRequest
-    from botocore.credentials import Credentials
-
-    role_credentials = {
-        "access_key": os.environ.get("SPAPI_AWS_ACCESS_KEY_ID"),
-        "secret_key": os.environ.get("SPAPI_AWS_SECRET_ACCESS_KEY"),
-        "session_token": os.environ.get("SPAPI_AWS_SESSION_TOKEN")  # Optional, for temporary creds
+        "client_id": lwa_client_id,
+        "client_secret": lwa_client_secret
     }
 
+    response = requests.post(url, data=data)
+    return response.json()["access_token"]
+
+def execute_signed_request(endpoint, body, access_token):
     region = "us-east-1"
+    host = "sellingpartnerapi-na.amazon.com"
     service = "execute-api"
-    url = f"https://sellingpartnerapi-na.amazon.com{endpoint}"
+    method = "POST"
+    canonical_uri = "/feeds/2021-06-30/documents"
 
-    headers = {
-        "host": "sellingpartnerapi-na.amazon.com",
-        "x-amz-access-token": access_token,
-        "content-type": "application/json"
-    }
+    access_key = os.environ['SPAPI_AWS_ACCESS_KEY_ID']
+    secret_key = os.environ['SPAPI_AWS_SECRET_ACCESS_KEY']
 
-    request = AWSRequest(
-        method=method,
-        url=url,
-        data=body,
-        headers=headers
+    now = datetime.datetime.utcnow()
+    amz_date = now.strftime('%Y%m%dT%H%M%SZ')
+    datestamp = now.strftime('%Y%m%d')
+
+    body_json = json.dumps(body)
+    payload_hash = hashlib.sha256(body_json.encode('utf-8')).hexdigest()
+
+    canonical_headers = f"host:{host}\nx-amz-access-token:{access_token}\nx-amz-date:{amz_date}\n"
+    signed_headers = "host;x-amz-access-token;x-amz-date"
+
+    canonical_request = f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    algorithm = "AWS4-HMAC-SHA256"
+    credential_scope = f"{datestamp}/{region}/{service}/aws4_request"
+    string_to_sign = f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+
+    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+    kDate = sign(('AWS4' + secret_key).encode('utf-8'), datestamp)
+    kRegion = sign(kDate, region)
+    kService = sign(kRegion, service)
+    kSigning = sign(kService, 'aws4_request')
+    signature = hmac.new(kSigning, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    authorization_header = (
+        f"{algorithm} Credential={access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, Signature={signature}"
     )
 
-    SigV4Auth(
-        Credentials(
-            role_credentials["access_key"],
-            role_credentials["secret_key"],
-            role_credentials.get("session_token")
-        ),
-        service,
-        region
-    ).add_auth(request)
+    headers = {
+        "x-amz-access-token": access_token,
+        "x-amz-date": amz_date,
+        "Authorization": authorization_header,
+        "Content-Type": "application/json"
+    }
 
-    return dict(request.headers)
+    response = requests.post(f"https://{host}{canonical_uri}", headers=headers, data=body_json)
+    return response.json()
 
+@app.post("/update-price")
+def update_price(payload: PriceUpdateRequest):
+    access_token = get_access_token()
+
+    feed_document = {
+        "contentType": "application/json"
+    }
+
+    # Step 1: Create Feed Document
+    doc_response = execute_signed_request("/feeds/2021-06-30/documents", feed_document, access_token)
+    upload_url = doc_response['url']
+    document_id = doc_response['feedDocumentId']
+
+    # Step 2: Upload listing update to that document
+    listings_payload = {
+        "sku": "electric-pickle-juice",  # Replace if needed
+        "type": "price",
+        "price": {
+            "currency": "USD",
+            "amount": str(payload.price)
+        }
+    }
+
+    headers = {"Content-Type": "application/json"}
+    requests.put(upload_url, data=json.dumps(listings_payload), headers=headers)
+
+    # Step 3: Submit Feed with document ID
+    feed_payload = {
+        "feedType": "JSON_LISTINGS_FEED",
+        "marketplaceIds": ["ATVPDKIKX0DER"],
+        "inputFeedDocumentId": document_id
+    }
+
+    feed_response = execute_signed_request("/feeds/2021-06-30/feeds", feed_payload, access_token)
+    return {"message": "Submitted price update feed", "feedId": feed_response.get("feedId")}
