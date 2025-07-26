@@ -1,27 +1,27 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
 import os
 
 app = FastAPI()
 
-# Root route (for health check)
+# Root route to verify the app is live
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to Chatzon backend!"}
+def root():
+    return {"message": "Welcome to Chatzon"}
 
-# Example model for incoming update-price request
-class PriceUpdate(BaseModel):
+# Update price request model
+class PriceUpdateRequest(BaseModel):
     asin: str
     sku: str
     new_price: float
 
-# POST route to simulate a price update
 @app.post("/update-price")
-async def update_price(payload: PriceUpdate):
+def update_price(req: PriceUpdateRequest):
+    # Simulate response for now
     return {
         "status": "success",
-        "asin": payload.asin,
-        "sku": payload.sku,
-        "new_price": payload.new_price
+        "asin": req.asin,
+        "sku": req.sku,
+        "new_price": req.new_price,
+        "message": "Price update request received"
     }
