@@ -1,27 +1,26 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# Root route to verify the app is live
 @app.get("/")
-def root():
+def read_root():
     return {"message": "Welcome to Chatzon"}
 
-# Update price request model
 class PriceUpdateRequest(BaseModel):
     asin: str
     sku: str
     new_price: float
 
 @app.post("/update-price")
-def update_price(req: PriceUpdateRequest):
-    # Simulate response for now
+def update_price(request: PriceUpdateRequest):
     return {
-        "status": "success",
-        "asin": req.asin,
-        "sku": req.sku,
-        "new_price": req.new_price,
-        "message": "Price update request received"
+        "message": "Price update simulated",
+        "asin": request.asin,
+        "sku": request.sku,
+        "new_price": request.new_price
     }
