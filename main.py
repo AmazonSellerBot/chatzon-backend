@@ -1,49 +1,61 @@
 import os
 import json
-from fastapi import FastAPI, Request, HTTPException
-from pydantic import BaseModel
-from starlette.responses import JSONResponse
-import requests
 import uuid
-import datetime
-import hashlib
 import hmac
+import hashlib
+import datetime
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
+
+# --------- MODEL ---------
 class PriceUpdateRequest(BaseModel):
     asin: str
     sku: str
     new_price: float
 
-# Load environment variables
-required_env_vars = [
-    "SPAPI_REFRESH_TOKEN", "SPAPI_LWA_CLIENT_ID", "SPAPI_LWA_CLIENT_SECRET",
-    "SPAPI_ROLE_ARN", "SPAPI_AWS_ACCESS_KEY_ID", "SPAPI_AWS_SECRET_ACCESS_KEY",
-    "SPAPI_SELLER_ID", "SPAPI_MARKETPLACE_ID"
-]
 
+# --------- ENVIRONMENT CHECK ---------
 def get_env(var):
     value = os.getenv(var)
     if not value:
         raise EnvironmentError(f"Missing required environment variable: {var}")
     return value
 
-credentials = {var: get_env(var) for var in required_env_vars}
 
-# === SIGNING + AUTH ===
+# Load once
+ENV = {
+    "REFRESH_TOKEN": get_env("SPAPI_REFRESH_TOKEN"),
+    "CLIENT_ID": get_env("SPAPI_LWA_CLIENT_ID"),
+    "CLIENT_SECRET": get_env("SPAPI_LWA_CLIENT_SECRET"),
+    "ROLE_ARN": get_env("SPAPI_ROLE_ARN"),
+    "AWS_ACCESS_KEY": get_env("SPAPI_AWS_ACCESS_KEY_ID"),
+    "AWS_SECRET_KEY": get_env("SPAPI_AWS_SECRET_ACCESS_KEY"),
+    "SELLER_ID": get_env("SPAPI_SELLER_ID"),
+    "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
+}
+
+
+# --------- AUTH ---------
 def get_access_token():
-    url = "https://api.amazon.com/auth/o2/token"
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": credentials["SPAPI_REFRESH_TOKEN"],
-        "client_id": credentials["SPAPI_LWA_CLIENT_ID"],
-        "client_secret": credentials["SPAPI_LWA_CLIENT_SECRET"]
-    }
-    response = requests.post(url, data=payload)
-    response.raise_for_status()
-    return response.json()["access_token"]
+    res = requests.post(
+        "https://api.amazon.com/auth/o2/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": ENV["REFRESH_TOKEN"],
+            "client_id": ENV["CLIENT_ID"],
+            "client_secret": ENV["CLIENT_SECRET"]
+        },
+    )
+    res.raise_for_status()
+    return res.json()["access_token"]
 
+
+# --------- SIGNING ---------
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
@@ -52,72 +64,78 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
 
     canonical_uri = endpoint
     canonical_querystring = ""
-    payload_hash = hashlib.sha256(body.encode('utf-8')).hexdigest()
-
+    payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
     canonical_headers = f"host:{host}\n" + f"x-amz-access-token:{access_token}\n" + f"x-amz-date:{amz_date}\n"
     signed_headers = "host;x-amz-access-token;x-amz-date"
-    canonical_request = f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    canonical_request = (
+        f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
 
     algorithm = "AWS4-HMAC-SHA256"
     credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    string_to_sign = (
+        f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
 
-    def sign(key, msg): return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
-    k_date = sign(("AWS4" + credentials["SPAPI_AWS_SECRET_ACCESS_KEY"]).encode('utf-8'), date_stamp)
+    def sign(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = sign(("AWS4" + ENV["AWS_SECRET_KEY"]).encode("utf-8"), date_stamp)
     k_region = sign(k_date, region)
     k_service = sign(k_region, service)
     k_signing = sign(k_service, "aws4_request")
-
-    signature = hmac.new(k_signing, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
     authorization_header = (
-        f"{algorithm} Credential={credentials['SPAPI_AWS_ACCESS_KEY_ID']}/{credential_scope}, "
+        f"{algorithm} Credential={ENV['AWS_ACCESS_KEY']}/{credential_scope}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
 
-    headers = {
+    return {
         "Content-Type": "application/json",
         "Host": host,
         "X-Amz-Date": amz_date,
         "X-Amz-Access-Token": access_token,
-        "Authorization": authorization_header
+        "Authorization": authorization_header,
     }
 
-    return headers
 
-# === MAIN ENDPOINT ===
+# --------- ROUTE ---------
 @app.post("/update-price")
-async def update_price(data: PriceUpdateRequest):
+def update_price(req: PriceUpdateRequest):
     try:
         access_token = get_access_token()
 
-        feed_doc_body = {
-            "contentType": "application/json; charset=UTF-8"
-        }
+        # STEP 1: Create feed document
+        doc_body = {"contentType": "application/json; charset=UTF-8"}
+        doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
 
-        doc_response = requests.post(
+        doc_res = requests.post(
             "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents",
-            headers=sign_request(
-                method="POST",
-                endpoint="/feeds/2021-06-30/documents",
-                body=json.dumps(feed_doc_body),
-                access_token=access_token
-            ),
-            json=feed_doc_body
+            headers=doc_headers,
+            json=doc_body
         )
-        doc_response.raise_for_status()
-        doc = doc_response.json()
+        doc_res.raise_for_status()
+        doc_json = doc_res.json()
 
-        url = doc["url"]
-        document_id = doc["documentId"]
+        # Handle missing documentId
+        if "documentId" not in doc_json or "url" not in doc_json:
+            return JSONResponse(status_code=500, content={
+                "status": "error",
+                "message": "Missing documentId or upload URL from SP-API",
+                "raw_response": doc_json
+            })
 
-        # Build feed
-        price_feed = {
-            "sku": data.sku,
+        document_id = doc_json["documentId"]
+        upload_url = doc_json["url"]
+
+        # STEP 2: Build feed content
+        feed_data = [{
+            "sku": req.sku,
             "productType": "PRODUCT",
             "attributes": {
                 "standard_product_id": {
-                    "value": data.asin,
+                    "value": req.asin,
                     "type": "ASIN"
                 },
                 "condition_type": {
@@ -125,43 +143,42 @@ async def update_price(data: PriceUpdateRequest):
                 },
                 "price": {
                     "currency": "USD",
-                    "amount": str(data.new_price)
+                    "amount": str(req.new_price)
                 },
                 "fulfillment_availability": [{
                     "fulfillment_channel_code": "DEFAULT",
                     "quantity": 1
                 }]
             }
-        }
+        }]
 
-        requests.put(url, data=json.dumps([price_feed]), headers={"Content-Type": "application/json"}).raise_for_status()
+        upload_res = requests.put(upload_url, headers={"Content-Type": "application/json"}, data=json.dumps(feed_data))
+        upload_res.raise_for_status()
 
-        # Submit feed
+        # STEP 3: Submit feed
         feed_body = {
-            "feedType": "POST_PRODUCT_PRICING_DATA",
-            "marketplaceIds": [credentials["SPAPI_MARKETPLACE_ID"]],
+            "feedType": "JSON_LISTINGS_FEED",
+            "marketplaceIds": [ENV["MARKETPLACE_ID"]],
             "inputFeedDocumentId": document_id
         }
 
-        feed_response = requests.post(
+        feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
+        feed_res = requests.post(
             "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds",
-            headers=sign_request(
-                method="POST",
-                endpoint="/feeds/2021-06-30/feeds",
-                body=json.dumps(feed_body),
-                access_token=access_token
-            ),
+            headers=feed_headers,
             json=feed_body
         )
-        feed_response.raise_for_status()
+        feed_res.raise_for_status()
+        feed_id = feed_res.json().get("feedId")
 
-        return JSONResponse(content={
+        return {
             "status": "success",
-            "asin": data.asin,
-            "sku": data.sku,
-            "new_price": data.new_price,
-            "feedId": feed_response.json().get("feedId")
-        })
+            "asin": req.asin,
+            "sku": req.sku,
+            "new_price": req.new_price,
+            "feedId": feed_id
+        }
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
