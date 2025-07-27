@@ -11,20 +11,19 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-
+# === Model for incoming request ===
 class ListingUpdateRequest(BaseModel):
     asin: str
     sku: str
-    field: str  # e.g., "title", "bullet_points", "price"
+    field: str  # "title", "bullet_points", "price", "search_terms", etc.
     value: str | float | list[str]
 
-
+# === Load environment variables ===
 def get_env(var):
     value = os.getenv(var)
     if not value:
         raise EnvironmentError(f"Missing environment variable: {var}")
     return value
-
 
 ENV = {
     "REFRESH_TOKEN": get_env("SPAPI_REFRESH_TOKEN"),
@@ -37,7 +36,7 @@ ENV = {
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
 
-
+# === Amazon LWA Access Token ===
 def get_access_token():
     res = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -51,7 +50,7 @@ def get_access_token():
     res.raise_for_status()
     return res.json()["access_token"]
 
-
+# === SP-API Signature Generator ===
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
@@ -59,19 +58,13 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
     date_stamp = now.strftime("%Y%m%d")
 
     canonical_uri = endpoint
-    canonical_querystring = ""
     payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    canonical_headers = f"host:{host}\n" + f"x-amz-access-token:{access_token}\n" + f"x-amz-date:{amz_date}\n"
+    canonical_headers = f"host:{host}\nx-amz-access-token:{access_token}\nx-amz-date:{amz_date}\n"
     signed_headers = "host;x-amz-access-token;x-amz-date"
-    canonical_request = (
-        f"{method}\n{canonical_uri}\n{canonical_querystring}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    )
+    canonical_request = f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
 
-    algorithm = "AWS4-HMAC-SHA256"
     credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = (
-        f"{algorithm}\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
-    )
+    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
 
     def sign(key, msg):
         return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -82,8 +75,8 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
     k_signing = sign(k_service, "aws4_request")
     signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    authorization_header = (
-        f"{algorithm} Credential={ENV['AWS_ACCESS_KEY']}/{credential_scope}, "
+    auth_header = (
+        f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{credential_scope}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
 
@@ -92,12 +85,11 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Host": host,
         "X-Amz-Date": amz_date,
         "X-Amz-Access-Token": access_token,
-        "Authorization": authorization_header,
+        "Authorization": auth_header
     }
 
-
+# === Build the attribute payload ===
 def build_listing_attributes(field, value):
-    # Build JSON_LISTINGS_FEED attributes depending on the field
     attributes = {}
     if field == "title":
         attributes["item_name"] = {"value": value}
@@ -111,26 +103,22 @@ def build_listing_attributes(field, value):
         raise ValueError(f"Unsupported field: {field}")
     return attributes
 
-
+# === Main universal route ===
 @app.post("/update-listing")
 def update_listing(req: ListingUpdateRequest):
     try:
         access_token = get_access_token()
 
-        # Step 1: Create feed document
+        # Step 1: Create Feed Document
         doc_body = {"contentType": "application/json; charset=UTF-8"}
         doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
-        doc_res = requests.post(
-            "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents",
-            headers=doc_headers,
-            json=doc_body
-        )
+        doc_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents", headers=doc_headers, json=doc_body)
         doc_res.raise_for_status()
         doc_json = doc_res.json()
         document_id = doc_json["feedDocumentId"]
         upload_url = doc_json["url"]
 
-        # Step 2: Build listing data
+        # Step 2: Upload Feed Data
         attributes = build_listing_attributes(req.field, req.value)
         feed_data = [{
             "sku": req.sku,
@@ -146,26 +134,17 @@ def update_listing(req: ListingUpdateRequest):
                 **attributes
             }
         }]
-
-        upload_res = requests.put(
-            upload_url,
-            headers={"Content-Type": "application/json; charset=UTF-8"},
-            data=json.dumps(feed_data)
-        )
+        upload_res = requests.put(upload_url, headers={"Content-Type": "application/json; charset=UTF-8"}, data=json.dumps(feed_data))
         upload_res.raise_for_status()
 
-        # Step 3: Submit the feed
+        # Step 3: Submit Feed
         feed_body = {
             "feedType": "JSON_LISTINGS_FEED",
             "marketplaceIds": [ENV["MARKETPLACE_ID"]],
             "inputFeedDocumentId": document_id
         }
         feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
-        feed_res = requests.post(
-            "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds",
-            headers=feed_headers,
-            json=feed_body
-        )
+        feed_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds", headers=feed_headers, json=feed_body)
         feed_res.raise_for_status()
         feed_id = feed_res.json().get("feedId")
 
