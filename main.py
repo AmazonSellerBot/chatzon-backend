@@ -24,7 +24,7 @@ class PriceUpdateFastRequest(BaseModel):
     sku: str
     new_price: float
 
-# === Load environment vars ===
+# === Load env vars ===
 def get_env(var):
     value = os.getenv(var)
     if not value:
@@ -42,7 +42,7 @@ ENV = {
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
 
-# === Amazon OAuth token ===
+# === Auth ===
 def get_access_token():
     res = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -57,7 +57,7 @@ def get_access_token():
     res.raise_for_status()
     return res.json()["access_token"]
 
-# === SP-API Signature ===
+# === Sign request ===
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
@@ -87,7 +87,7 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Authorization": f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     }
 
-# === Feed Attribute Builder ===
+# === Listing attribute builder ===
 def build_listing_attributes(field, value):
     if field == "title":
         return {"item_name": {"value": value}}
@@ -189,19 +189,32 @@ def feed_status(feedId: str = Query(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# === /feed-result ===
+# === /feed-result (supports CSV fallback) ===
 @app.get("/feed-result")
 def feed_result(documentId: str = Query(...)):
     try:
         access_token = get_access_token()
         headers = sign_request("GET", f"/feeds/2021-06-30/documents/{documentId}", "", access_token)
-        doc_res = requests.get(f"https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents/{documentId}", headers=headers, timeout=10)
+        doc_res = requests.get(
+            f"https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents/{documentId}",
+            headers=headers,
+            timeout=10
+        )
         doc_res.raise_for_status()
         url = doc_res.json()["url"]
 
-        file_res = requests.get(url, timeout=10)
-        file_res.raise_for_status()
-        return file_res.json()
+        result_res = requests.get(url, timeout=10)
+        result_res.raise_for_status()
+
+        try:
+            return result_res.json()
+        except json.JSONDecodeError:
+            return {
+                "status": "success",
+                "format": "text/csv or non-JSON",
+                "raw_text": result_res.text[:500]
+            }
+
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
