@@ -11,23 +11,17 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-
-# --------- MODEL ---------
 class PriceUpdateRequest(BaseModel):
     asin: str
     sku: str
     new_price: float
 
-
-# --------- ENVIRONMENT CHECK ---------
 def get_env(var):
     value = os.getenv(var)
     if not value:
         raise EnvironmentError(f"Missing required environment variable: {var}")
     return value
 
-
-# Load once
 ENV = {
     "REFRESH_TOKEN": get_env("SPAPI_REFRESH_TOKEN"),
     "CLIENT_ID": get_env("SPAPI_LWA_CLIENT_ID"),
@@ -39,8 +33,6 @@ ENV = {
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
 
-
-# --------- AUTH ---------
 def get_access_token():
     res = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -54,8 +46,6 @@ def get_access_token():
     res.raise_for_status()
     return res.json()["access_token"]
 
-
-# --------- SIGNING ---------
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
@@ -99,8 +89,6 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Authorization": authorization_header,
     }
 
-
-# --------- ROUTE ---------
 @app.post("/update-price")
 def update_price(req: PriceUpdateRequest):
     try:
@@ -118,18 +106,18 @@ def update_price(req: PriceUpdateRequest):
         doc_res.raise_for_status()
         doc_json = doc_res.json()
 
-        # Handle missing documentId
-        if "documentId" not in doc_json or "url" not in doc_json:
+        # 🔧 FIXED: Use correct key name from Amazon's real response
+        if "feedDocumentId" not in doc_json or "url" not in doc_json:
             return JSONResponse(status_code=500, content={
                 "status": "error",
-                "message": "Missing documentId or upload URL from SP-API",
+                "message": "Missing feedDocumentId or upload URL from SP-API",
                 "raw_response": doc_json
             })
 
-        document_id = doc_json["documentId"]
+        document_id = doc_json["feedDocumentId"]
         upload_url = doc_json["url"]
 
-        # STEP 2: Build feed content
+        # STEP 2: Upload the feed data
         feed_data = [{
             "sku": req.sku,
             "productType": "PRODUCT",
@@ -155,7 +143,7 @@ def update_price(req: PriceUpdateRequest):
         upload_res = requests.put(upload_url, headers={"Content-Type": "application/json"}, data=json.dumps(feed_data))
         upload_res.raise_for_status()
 
-        # STEP 3: Submit feed
+        # STEP 3: Submit the feed
         feed_body = {
             "feedType": "JSON_LISTINGS_FEED",
             "marketplaceIds": [ENV["MARKETPLACE_ID"]],
@@ -181,4 +169,3 @@ def update_price(req: PriceUpdateRequest):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
-
