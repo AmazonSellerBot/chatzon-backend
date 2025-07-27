@@ -5,22 +5,25 @@ import hmac
 import hashlib
 import datetime
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
+
 
 class PriceUpdateRequest(BaseModel):
     asin: str
     sku: str
     new_price: float
 
+
 def get_env(var):
     value = os.getenv(var)
     if not value:
         raise EnvironmentError(f"Missing required environment variable: {var}")
     return value
+
 
 ENV = {
     "REFRESH_TOKEN": get_env("SPAPI_REFRESH_TOKEN"),
@@ -32,6 +35,7 @@ ENV = {
     "SELLER_ID": get_env("SPAPI_SELLER_ID"),
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
+
 
 def get_access_token():
     res = requests.post(
@@ -45,6 +49,7 @@ def get_access_token():
     )
     res.raise_for_status()
     return res.json()["access_token"]
+
 
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
@@ -89,6 +94,7 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Authorization": authorization_header,
     }
 
+
 @app.post("/update-price")
 def update_price(req: PriceUpdateRequest):
     try:
@@ -106,7 +112,6 @@ def update_price(req: PriceUpdateRequest):
         doc_res.raise_for_status()
         doc_json = doc_res.json()
 
-        # 🔧 FIXED: Use correct key name from Amazon's real response
         if "feedDocumentId" not in doc_json or "url" not in doc_json:
             return JSONResponse(status_code=500, content={
                 "status": "error",
@@ -140,7 +145,11 @@ def update_price(req: PriceUpdateRequest):
             }
         }]
 
-        upload_res = requests.put(upload_url, headers={"Content-Type": "application/json"}, data=json.dumps(feed_data))
+        upload_res = requests.put(
+            upload_url,
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            data=json.dumps(feed_data)
+        )
         upload_res.raise_for_status()
 
         # STEP 3: Submit the feed
