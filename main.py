@@ -5,24 +5,29 @@ import hmac
 import hashlib
 import datetime
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
-# === Model for incoming request ===
+# === Models ===
 class ListingUpdateRequest(BaseModel):
     asin: str
     sku: str
-    field: str  # "title", "bullet_points", "price", "search_terms", etc.
+    field: str
     value: str | float | list[str]
 
-# === Load environment variables ===
+class PriceUpdateFastRequest(BaseModel):
+    asin: str
+    sku: str
+    new_price: float
+
+# === Environment ===
 def get_env(var):
     value = os.getenv(var)
     if not value:
-        raise EnvironmentError(f"Missing environment variable: {var}")
+        raise EnvironmentError(f"Missing env var: {var}")
     return value
 
 ENV = {
@@ -36,7 +41,7 @@ ENV = {
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
 
-# === Amazon LWA Access Token ===
+# === Auth ===
 def get_access_token():
     res = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -45,26 +50,29 @@ def get_access_token():
             "refresh_token": ENV["REFRESH_TOKEN"],
             "client_id": ENV["CLIENT_ID"],
             "client_secret": ENV["CLIENT_SECRET"]
-        },
+        }
     )
     res.raise_for_status()
     return res.json()["access_token"]
 
-# === SP-API Signature Generator ===
+# === Signing ===
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date_stamp = now.strftime("%Y%m%d")
-
-    canonical_uri = endpoint
     payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+
     canonical_headers = f"host:{host}\nx-amz-access-token:{access_token}\nx-amz-date:{amz_date}\n"
     signed_headers = "host;x-amz-access-token;x-amz-date"
-    canonical_request = f"{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    canonical_request = (
+        f"{method}\n{endpoint}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
 
-    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
+    )
 
     def sign(key, msg):
         return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
@@ -76,7 +84,7 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
     signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
     auth_header = (
-        f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{credential_scope}, "
+        f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{scope}, "
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
 
@@ -85,10 +93,10 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Host": host,
         "X-Amz-Date": amz_date,
         "X-Amz-Access-Token": access_token,
-        "Authorization": auth_header
+        "Authorization": auth_header,
     }
 
-# === Build the attribute payload ===
+# === Utility: Build attributes for listing feed ===
 def build_listing_attributes(field, value):
     attributes = {}
     if field == "title":
@@ -103,13 +111,12 @@ def build_listing_attributes(field, value):
         raise ValueError(f"Unsupported field: {field}")
     return attributes
 
-# === Main universal route ===
+# === Route: /update-listing ===
 @app.post("/update-listing")
 def update_listing(req: ListingUpdateRequest):
     try:
         access_token = get_access_token()
 
-        # Step 1: Create Feed Document
         doc_body = {"contentType": "application/json; charset=UTF-8"}
         doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
         doc_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents", headers=doc_headers, json=doc_body)
@@ -118,7 +125,6 @@ def update_listing(req: ListingUpdateRequest):
         document_id = doc_json["feedDocumentId"]
         upload_url = doc_json["url"]
 
-        # Step 2: Upload Feed Data
         attributes = build_listing_attributes(req.field, req.value)
         feed_data = [{
             "sku": req.sku,
@@ -134,10 +140,10 @@ def update_listing(req: ListingUpdateRequest):
                 **attributes
             }
         }]
+
         upload_res = requests.put(upload_url, headers={"Content-Type": "application/json; charset=UTF-8"}, data=json.dumps(feed_data))
         upload_res.raise_for_status()
 
-        # Step 3: Submit Feed
         feed_body = {
             "feedType": "JSON_LISTINGS_FEED",
             "marketplaceIds": [ENV["MARKETPLACE_ID"]],
@@ -146,16 +152,76 @@ def update_listing(req: ListingUpdateRequest):
         feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
         feed_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds", headers=feed_headers, json=feed_body)
         feed_res.raise_for_status()
-        feed_id = feed_res.json().get("feedId")
+        feed_id = feed_res.json()["feedId"]
 
         return {
             "status": "success",
+            "type": "listing_update",
             "asin": req.asin,
-            "sku": req.sku,
             "field": req.field,
             "value": req.value,
             "feedId": feed_id
         }
 
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# === Route: /update-price-fast ===
+@app.post("/update-price-fast")
+def update_price_fast(req: PriceUpdateFastRequest):
+    try:
+        access_token = get_access_token()
+
+        doc_body = {"contentType": "application/json; charset=UTF-8"}
+        doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
+        doc_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents", headers=doc_headers, json=doc_body)
+        doc_res.raise_for_status()
+        doc_json = doc_res.json()
+        document_id = doc_json["feedDocumentId"]
+        upload_url = doc_json["url"]
+
+        feed_data = [{
+            "sku": req.sku,
+            "standard_price": {
+                "currency": "USD",
+                "amount": str(req.new_price)
+            }
+        }]
+
+        upload_res = requests.put(upload_url, headers={"Content-Type": "application/json; charset=UTF-8"}, data=json.dumps(feed_data))
+        upload_res.raise_for_status()
+
+        feed_body = {
+            "feedType": "POST_PRODUCT_PRICING_DATA",
+            "marketplaceIds": [ENV["MARKETPLACE_ID"]],
+            "inputFeedDocumentId": document_id
+        }
+
+        feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
+        feed_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds", headers=feed_headers, json=feed_body)
+        feed_res.raise_for_status()
+        feed_id = feed_res.json()["feedId"]
+
+        return {
+            "status": "success",
+            "type": "price_update",
+            "asin": req.asin,
+            "sku": req.sku,
+            "new_price": req.new_price,
+            "feedId": feed_id
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+
+# === Route: /feed-status ===
+@app.get("/feed-status")
+def feed_status(feedId: str = Query(...)):
+    try:
+        access_token = get_access_token()
+        headers = sign_request("GET", f"/feeds/2021-06-30/feeds/{feedId}", "", access_token)
+        res = requests.get(f"https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds/{feedId}", headers=headers)
+        res.raise_for_status()
+        return res.json()
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
