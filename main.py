@@ -12,16 +12,17 @@ from fastapi.responses import JSONResponse
 app = FastAPI()
 
 
-class PriceUpdateRequest(BaseModel):
+class ListingUpdateRequest(BaseModel):
     asin: str
     sku: str
-    new_price: float
+    field: str  # e.g., "title", "bullet_points", "price"
+    value: str | float | list[str]
 
 
 def get_env(var):
     value = os.getenv(var)
     if not value:
-        raise EnvironmentError(f"Missing required environment variable: {var}")
+        raise EnvironmentError(f"Missing environment variable: {var}")
     return value
 
 
@@ -95,15 +96,30 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
     }
 
 
-@app.post("/update-price")
-def update_price(req: PriceUpdateRequest):
+def build_listing_attributes(field, value):
+    # Build JSON_LISTINGS_FEED attributes depending on the field
+    attributes = {}
+    if field == "title":
+        attributes["item_name"] = {"value": value}
+    elif field == "bullet_points":
+        attributes["bullet_point"] = [{"value": bp} for bp in value]
+    elif field == "price":
+        attributes["price"] = {"currency": "USD", "amount": str(value)}
+    elif field == "search_terms":
+        attributes["generic_keyword"] = [{"value": term} for term in value]
+    else:
+        raise ValueError(f"Unsupported field: {field}")
+    return attributes
+
+
+@app.post("/update-listing")
+def update_listing(req: ListingUpdateRequest):
     try:
         access_token = get_access_token()
 
-        # STEP 1: Create feed document
+        # Step 1: Create feed document
         doc_body = {"contentType": "application/json; charset=UTF-8"}
         doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
-
         doc_res = requests.post(
             "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents",
             headers=doc_headers,
@@ -111,18 +127,11 @@ def update_price(req: PriceUpdateRequest):
         )
         doc_res.raise_for_status()
         doc_json = doc_res.json()
-
-        if "feedDocumentId" not in doc_json or "url" not in doc_json:
-            return JSONResponse(status_code=500, content={
-                "status": "error",
-                "message": "Missing feedDocumentId or upload URL from SP-API",
-                "raw_response": doc_json
-            })
-
         document_id = doc_json["feedDocumentId"]
         upload_url = doc_json["url"]
 
-        # STEP 2: Upload the feed data
+        # Step 2: Build listing data
+        attributes = build_listing_attributes(req.field, req.value)
         feed_data = [{
             "sku": req.sku,
             "productType": "PRODUCT",
@@ -134,14 +143,7 @@ def update_price(req: PriceUpdateRequest):
                 "condition_type": {
                     "value": "new_new"
                 },
-                "price": {
-                    "currency": "USD",
-                    "amount": str(req.new_price)
-                },
-                "fulfillment_availability": [{
-                    "fulfillment_channel_code": "DEFAULT",
-                    "quantity": 1
-                }]
+                **attributes
             }
         }]
 
@@ -152,13 +154,12 @@ def update_price(req: PriceUpdateRequest):
         )
         upload_res.raise_for_status()
 
-        # STEP 3: Submit the feed
+        # Step 3: Submit the feed
         feed_body = {
             "feedType": "JSON_LISTINGS_FEED",
             "marketplaceIds": [ENV["MARKETPLACE_ID"]],
             "inputFeedDocumentId": document_id
         }
-
         feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
         feed_res = requests.post(
             "https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds",
@@ -172,7 +173,8 @@ def update_price(req: PriceUpdateRequest):
             "status": "success",
             "asin": req.asin,
             "sku": req.sku,
-            "new_price": req.new_price,
+            "field": req.field,
+            "value": req.value,
             "feedId": feed_id
         }
 
