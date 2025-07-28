@@ -8,11 +8,10 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 app = FastAPI()
 
-# === Models ===
 class ListingUpdateRequest(BaseModel):
     asin: str
     sku: str
@@ -24,7 +23,6 @@ class PriceUpdateFastRequest(BaseModel):
     sku: str
     new_price: float
 
-# === Load env vars ===
 def get_env(var):
     value = os.getenv(var)
     if not value:
@@ -42,7 +40,6 @@ ENV = {
     "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
 }
 
-# === Auth ===
 def get_access_token():
     res = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -57,7 +54,6 @@ def get_access_token():
     res.raise_for_status()
     return res.json()["access_token"]
 
-# === Sign request ===
 def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
     host = "sellingpartnerapi-na.amazon.com"
     now = datetime.datetime.utcnow()
@@ -87,20 +83,6 @@ def sign_request(method, endpoint, body, access_token, region="us-east-1", servi
         "Authorization": f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     }
 
-# === Listing attribute builder ===
-def build_listing_attributes(field, value):
-    if field == "title":
-        return {"item_name": {"value": value}}
-    elif field == "bullet_points":
-        return {"bullet_point": [{"value": bp} for bp in value]}
-    elif field == "price":
-        return {"price": {"currency": "USD", "amount": str(value)}}
-    elif field == "search_terms":
-        return {"generic_keyword": [{"value": term} for term in value]}
-    else:
-        raise ValueError(f"Unsupported field: {field}")
-
-# === /update-listing ===
 @app.post("/update-listing")
 def update_listing(req: ListingUpdateRequest):
     try:
@@ -111,14 +93,13 @@ def update_listing(req: ListingUpdateRequest):
         document_id = doc_res.json()["feedDocumentId"]
         upload_url = doc_res.json()["url"]
 
-        attributes = build_listing_attributes(req.field, req.value)
         feed_data = [{
             "sku": req.sku,
             "productType": "PRODUCT",
             "attributes": {
                 "standard_product_id": {"value": req.asin, "type": "ASIN"},
                 "condition_type": {"value": "new_new"},
-                **attributes
+                **build_listing_attributes(req.field, req.value)
             }
         }]
 
@@ -140,7 +121,18 @@ def update_listing(req: ListingUpdateRequest):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# === /update-price-fast ===
+def build_listing_attributes(field, value):
+    if field == "title":
+        return {"item_name": {"value": value}}
+    elif field == "bullet_points":
+        return {"bullet_point": [{"value": bp} for bp in value]}
+    elif field == "price":
+        return {"price": {"currency": "USD", "amount": str(value)}}
+    elif field == "search_terms":
+        return {"generic_keyword": [{"value": term} for term in value]}
+    else:
+        raise ValueError(f"Unsupported field: {field}")
+
 @app.post("/update-price-fast")
 def update_price_fast(req: PriceUpdateFastRequest):
     try:
@@ -177,7 +169,6 @@ def update_price_fast(req: PriceUpdateFastRequest):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# === /feed-status ===
 @app.get("/feed-status")
 def feed_status(feedId: str = Query(...)):
     try:
@@ -189,7 +180,6 @@ def feed_status(feedId: str = Query(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# === /feed-result (supports CSV fallback) ===
 @app.get("/feed-result")
 def feed_result(documentId: str = Query(...)):
     try:
@@ -218,7 +208,26 @@ def feed_result(documentId: str = Query(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# === /scrape-listing ===
+@app.get("/feed-result-raw")
+def feed_result_raw(documentId: str = Query(...)):
+    try:
+        access_token = get_access_token()
+        headers = sign_request("GET", f"/feeds/2021-06-30/documents/{documentId}", "", access_token)
+        doc_res = requests.get(
+            f"https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents/{documentId}",
+            headers=headers,
+            timeout=10
+        )
+        doc_res.raise_for_status()
+        url = doc_res.json()["url"]
+
+        result_res = requests.get(url, timeout=10)
+        result_res.raise_for_status()
+
+        return PlainTextResponse(content=result_res.text, media_type="text/plain")
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.get("/scrape-listing")
 def scrape_listing(asin: str = Query(...)):
     try:
