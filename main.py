@@ -1,128 +1,143 @@
+from fastapi import FastAPI
+from pydantic import BaseModel
 import os
 import json
-import uuid
-import hmac
-import hashlib
-import datetime
-import requests
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse, PlainTextResponse
-from pydantic import BaseModel
+from typing import List
+from utils import execute_signed_request
 
 app = FastAPI()
 
-class PriceUpdateFastRequest(BaseModel):
-    asin: str
+# ---------- Price Update ----------
+class PriceUpdateRequest(BaseModel):
     sku: str
-    new_price: float
-
-def get_env(var):
-    value = os.getenv(var)
-    if not value:
-        raise EnvironmentError(f"Missing env var: {var}")
-    return value
-
-ENV = {
-    "REFRESH_TOKEN": get_env("SPAPI_REFRESH_TOKEN"),
-    "CLIENT_ID": get_env("SPAPI_LWA_CLIENT_ID"),
-    "CLIENT_SECRET": get_env("SPAPI_LWA_CLIENT_SECRET"),
-    "ROLE_ARN": get_env("SPAPI_ROLE_ARN"),
-    "AWS_ACCESS_KEY": get_env("SPAPI_AWS_ACCESS_KEY_ID"),
-    "AWS_SECRET_KEY": get_env("SPAPI_AWS_SECRET_ACCESS_KEY"),
-    "SELLER_ID": get_env("SPAPI_SELLER_ID"),
-    "MARKETPLACE_ID": get_env("SPAPI_MARKETPLACE_ID"),
-}
-
-def get_access_token():
-    res = requests.post(
-        "https://api.amazon.com/auth/o2/token",
-        data={
-            "grant_type": "refresh_token",
-            "refresh_token": ENV["REFRESH_TOKEN"],
-            "client_id": ENV["CLIENT_ID"],
-            "client_secret": ENV["CLIENT_SECRET"]
-        },
-        timeout=10
-    )
-    res.raise_for_status()
-    return res.json()["access_token"]
-
-def sign_request(method, endpoint, body, access_token, region="us-east-1", service="execute-api"):
-    host = "sellingpartnerapi-na.amazon.com"
-    now = datetime.datetime.utcnow()
-    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = now.strftime("%Y%m%d")
-    payload_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    canonical_headers = f"host:{host}\nx-amz-access-token:{access_token}\nx-amz-date:{amz_date}\n"
-    signed_headers = "host;x-amz-access-token;x-amz-date"
-    canonical_request = f"{method}\n{endpoint}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()}"
-
-    def sign(key, msg):
-        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-    k_date = sign(("AWS4" + ENV["AWS_SECRET_KEY"]).encode("utf-8"), date_stamp)
-    k_region = sign(k_date, region)
-    k_service = sign(k_region, service)
-    k_signing = sign(k_service, "aws4_request")
-    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    return {
-        "Content-Type": "application/json",
-        "Host": host,
-        "X-Amz-Date": amz_date,
-        "X-Amz-Access-Token": access_token,
-        "Authorization": f"AWS4-HMAC-SHA256 Credential={ENV['AWS_ACCESS_KEY']}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
-    }
+    price: float
+    currency: str = "USD"
+    marketplaceId: str = "ATVPDKIKX0DER"  # US default
 
 @app.post("/update-price-fast")
-def update_price_fast(req: PriceUpdateFastRequest):
-    try:
-        access_token = get_access_token()
+def update_price_fast(data: PriceUpdateRequest):
+    sku = data.sku
+    price = data.price
+    currency = data.currency
+    marketplace_id = data.marketplaceId
 
-        # Step 1: Create a feed document
-        doc_body = {"contentType": "application/json; charset=UTF-8"}
-        doc_headers = sign_request("POST", "/feeds/2021-06-30/documents", json.dumps(doc_body), access_token)
-        doc_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/documents",
-                                headers=doc_headers, json=doc_body)
-        doc_res.raise_for_status()
-        doc_info = doc_res.json()
-        document_id = doc_info["feedDocumentId"]
-        upload_url = doc_info["url"]
+    path = f"/listings/2021-08-01/items/{os.getenv('SELLER_ID')}/{sku}"
+    query_params = {
+        "marketplaceIds": marketplace_id
+    }
 
-        # Step 2: Format payload using proper JSON feed schema
-        feed_data = [{
-            "sku": req.sku,
-            "pricing": {
-                "standardPrice": {
-                    "currency": "USD",
-                    "amount": str(req.new_price)
-                }
+    price_payload = {
+        "productType": "PRODUCT",
+        "patches": [
+            {
+                "op": "replace",
+                "path": "/attributes/standard_price",
+                "value": [
+                    {
+                        "currency": currency,
+                        "amount": str(price)
+                    }
+                ]
             }
-        }]
+        ]
+    }
 
-        # Upload the JSON to Amazon
-        upload_headers = {"Content-Type": "application/json; charset=UTF-8"}
-        put_res = requests.put(upload_url, headers=upload_headers, data=json.dumps(feed_data))
-        put_res.raise_for_status()
+    headers = {
+        "Content-Type": "application/json"
+    }
 
-        # Step 3: Submit the feed
-        feed_body = {
-            "feedType": "POST_PRODUCT_PRICING_DATA",
-            "marketplaceIds": [ENV["MARKETPLACE_ID"]],
-            "inputFeedDocumentId": document_id
-        }
-        feed_headers = sign_request("POST", "/feeds/2021-06-30/feeds", json.dumps(feed_body), access_token)
-        feed_res = requests.post("https://sellingpartnerapi-na.amazon.com/feeds/2021-06-30/feeds",
-                                 headers=feed_headers, json=feed_body)
-        feed_res.raise_for_status()
-        return {
-            "status": "success",
-            "feedId": feed_res.json()["feedId"],
-            "asin": req.asin,
-            "sku": req.sku,
-            "new_price": req.new_price
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
+    response = execute_signed_request(
+        method="PATCH",
+        endpoint="https://sellingpartnerapi-na.amazon.com",
+        path=path,
+        params=query_params,
+        data=json.dumps(price_payload),
+        headers=headers
+    )
+
+    return {
+        "status": "success" if response.status_code in [200, 202] else "error",
+        "code": response.status_code,
+        "response": response.json()
+    }
+
+# ---------- Listing Content Update ----------
+class ListingUpdateRequest(BaseModel):
+    sku: str
+    title: str = None
+    bullets: List[str] = []
+    description: str = None
+    search_terms: List[str] = []
+    marketplaceId: str = "ATVPDKIKX0DER"
+
+@app.post("/update-listing")
+def update_listing(data: ListingUpdateRequest):
+    sku = data.sku
+    marketplace_id = data.marketplaceId
+
+    path = f"/listings/2021-08-01/items/{os.getenv('SELLER_ID')}/{sku}"
+    query_params = {
+        "marketplaceIds": marketplace_id
+    }
+
+    patches = []
+
+    if data.title:
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/item_name",
+            "value": [{"value": data.title}]
+        })
+
+    if data.bullets:
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/bullet_point",
+            "value": [{"value": b} for b in data.bullets]
+        })
+
+    if data.description:
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/product_description",
+            "value": [{"value": data.description}]
+        })
+
+    if data.search_terms:
+        patches.append({
+            "op": "replace",
+            "path": "/attributes/generic_keyword",
+            "value": [{"value": t} for t in data.search_terms]
+        })
+
+    if not patches:
+        return {"status": "error", "message": "No updates provided."}
+
+    payload = {
+        "productType": "PRODUCT",
+        "patches": patches
+    }
+
+    headers = {
+        "Content-Type": "application/json"
+    }
+
+    response = execute_signed_request(
+        method="PATCH",
+        endpoint="https://sellingpartnerapi-na.amazon.com",
+        path=path,
+        params=query_params,
+        data=json.dumps(payload),
+        headers=headers
+    )
+
+    return {
+        "status": "success" if response.status_code in [200, 202] else "error",
+        "code": response.status_code,
+        "response": response.json()
+    }
+
+# ---------- Root Test ----------
+@app.get("/")
+def root():
+    return {"message": "Chatzon Listings API is live."}
