@@ -141,3 +141,4 @@ def update_listing(data: ListingUpdateRequest):
 @app.get("/")
 def root():
     return {"message": "Chatzon Listings API is live."}
+ 
