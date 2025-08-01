@@ -1,33 +1,31 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
+import requests
 import os
-import json
-from typing import List
-from utils import execute_signed_request
 
 app = FastAPI()
 
-# ---------- Price Update ----------
+# === AMAZON CREDS FROM ENV ===
+SELLER_ID = os.getenv("SELLER_ID")
+MARKETPLACE_ID = os.getenv("MARKETPLACE_ID")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")  # make sure this is set in Railway
+
+# === INPUT MODEL ===
 class PriceUpdateRequest(BaseModel):
+    asin: str
     sku: str
     price: float
-    currency: str = "USD"
-    marketplaceId: str = "ATVPDKIKX0DER"
 
+# === ENDPOINT ===
 @app.post("/update-price-fast")
-def update_price_fast(data: PriceUpdateRequest):
+async def update_price_fast(data: PriceUpdateRequest):
     try:
-        sku = data.sku
-        price = data.price
-        currency = data.currency
-        marketplace_id = data.marketplaceId
-
-        path = f"/listings/2021-08-01/items/{os.getenv('SELLER_ID')}/{sku}"
-        query_params = {
-            "marketplaceIds": marketplace_id
+        headers = {
+            "Content-Type": "application/json",
+            "x-amz-access-token": ACCESS_TOKEN,
         }
 
-        price_payload = {
+        payload = {
             "productType": "PRODUCT",
             "patches": [
                 {
@@ -35,125 +33,31 @@ def update_price_fast(data: PriceUpdateRequest):
                     "path": "/attributes/standard_price",
                     "value": [
                         {
-                            "currency": currency,
-                            "amount": str(price)
+                            "currency": "USD",
+                            "value": str(data.price)
                         }
                     ]
                 }
             ]
         }
 
-        headers = {
-            "Content-Type": "application/json"
+        url = f"https://sellingpartnerapi-na.amazon.com/listings/2021-08-01/items/{SELLER_ID}/{data.sku}"
+
+        params = {
+            "marketplaceIds": MARKETPLACE_ID
         }
 
-        response = execute_signed_request(
-            method="PATCH",
-            endpoint="https://sellingpartnerapi-na.amazon.com",
-            path=path,
-            params=query_params,
-            data=json.dumps(price_payload),
-            headers=headers
-        )
+        response = requests.patch(url, headers=headers, json=payload, params=params)
 
         return {
-            "status": "success" if response.status_code in [200, 202] else "error",
-            "code": response.status_code,
+            "status": "success",
+            "amazon_status_code": response.status_code,
             "response": response.json()
         }
 
     except Exception as e:
-        print("🔥 ERROR during price update:", str(e))
-        return {
-            "status": "error",
-            "message": str(e)
-        }
+        return {"status": "error", "message": str(e)}
 
-# ---------- Listing Content Update ----------
-class ListingUpdateRequest(BaseModel):
-    sku: str
-    title: str = None
-    bullets: List[str] = []
-    description: str = None
-    search_terms: List[str] = []
-    marketplaceId: str = "ATVPDKIKX0DER"
-
-@app.post("/update-listing")
-def update_listing(data: ListingUpdateRequest):
-    try:
-        sku = data.sku
-        marketplace_id = data.marketplaceId
-
-        path = f"/listings/2021-08-01/items/{os.getenv('SELLER_ID')}/{sku}"
-        query_params = {
-            "marketplaceIds": marketplace_id
-        }
-
-        patches = []
-
-        if data.title:
-            patches.append({
-                "op": "replace",
-                "path": "/attributes/item_name",
-                "value": [{"value": data.title}]
-            })
-
-        if data.bullets:
-            patches.append({
-                "op": "replace",
-                "path": "/attributes/bullet_point",
-                "value": [{"value": b} for b in data.bullets]
-            })
-
-        if data.description:
-            patches.append({
-                "op": "replace",
-                "path": "/attributes/product_description",
-                "value": [{"value": data.description}]
-            })
-
-        if data.search_terms:
-            patches.append({
-                "op": "replace",
-                "path": "/attributes/generic_keyword",
-                "value": [{"value": t} for t in data.search_terms]
-            })
-
-        if not patches:
-            return {"status": "error", "message": "No updates provided."}
-
-        payload = {
-            "productType": "PRODUCT",
-            "patches": patches
-        }
-
-        headers = {
-            "Content-Type": "application/json"
-        }
-
-        response = execute_signed_request(
-            method="PATCH",
-            endpoint="https://sellingpartnerapi-na.amazon.com",
-            path=path,
-            params=query_params,
-            data=json.dumps(payload),
-            headers=headers
-        )
-
-        return {
-            "status": "success" if response.status_code in [200, 202] else "error",
-            "code": response.status_code,
-            "response": response.json()
-        }
-
-    except Exception as e:
-        print("🔥 ERROR during listing update:", str(e))
-        return {
-            "status": "error",
-            "message": str(e)
-        }
-
-# ---------- Root Test ----------
 @app.get("/")
 def root():
-    return {"message": "Chatzon Listings API is live."}
+    return {"status": "ok", "message": "Chatzon backend is live."}
