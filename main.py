@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+import os
 
 app = FastAPI()
 
@@ -19,4 +20,14 @@ async def callback(request: Request):
         "message": "Authorization code received!",
         "authorization_code": code,
         "state": state
+    }
+
+@app.get("/env")
+def read_env():
+    return {
+        "PORT": os.getenv("PORT"),
+        "SPAPI_REFRESH_TOKEN": os.getenv("SPAPI_REFRESH_TOKEN"),
+        "LWA_CLIENT_ID": os.getenv("LWA_CLIENT_ID"),
+        "LWA_CLIENT_SECRET": os.getenv("LWA_CLIENT_SECRET"),
+        "SELLER_ID": os.getenv("SELLER_ID")
     }
