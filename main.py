@@ -23,11 +23,15 @@ async def callback(request: Request):
     }
 
 @app.get("/env")
-def read_env():
+def env_check():
     return {
         "PORT": os.getenv("PORT"),
         "SPAPI_REFRESH_TOKEN": os.getenv("SPAPI_REFRESH_TOKEN"),
-        "LWA_CLIENT_ID": os.getenv("LWA_CLIENT_ID"),
-        "LWA_CLIENT_SECRET": os.getenv("LWA_CLIENT_SECRET"),
-        "SELLER_ID": os.getenv("SELLER_ID")
+        "SPAPI_AWS_ACCESS_KEY_ID": os.getenv("SPAPI_AWS_ACCESS_KEY_ID"),
+        "SPAPI_AWS_SECRET_ACCESS_KEY": os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY"),
+        "SPAPI_LWA_CLIENT_ID": os.getenv("SPAPI_LWA_CLIENT_ID"),
+        "SPAPI_LWA_CLIENT_SECRET": os.getenv("SPAPI_LWA_CLIENT_SECRET"),
+        "SPAPI_ROLE_ARN": os.getenv("SPAPI_ROLE_ARN"),
+        "SPAPI_SELLER_ID": os.getenv("SPAPI_SELLER_ID"),
+        "SPAPI_MARKETPLACE_ID": os.getenv("SPAPI_MARKETPLACE_ID")
     }
