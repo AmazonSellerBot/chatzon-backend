@@ -2,7 +2,6 @@
 import os
 import hmac
 import json
-import base64
 import hashlib
 import logging
 import datetime as dt
@@ -13,25 +12,13 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 # ---------------------------
-# Config & Logging
+# App setup & logging
 # ---------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chatzon")
-
 APP_NAME = "Chatzon SP-API Bridge"
 
-# Required ENV (set these on Railway)
-# LWA_CLIENT_ID
-# LWA_CLIENT_SECRET
-# LWA_REFRESH_TOKEN
-# AWS_ACCESS_KEY_ID
-# AWS_SECRET_ACCESS_KEY
-# AWS_ROLE_ARN (optional if you’re not assuming a role)
-# AWS_SESSION_TOKEN (optional if you’re assuming a role externally)
-# SELLER_ID  (Amazon merchant ID)
-# REGION  (e.g., "us-east-1")
-# SP_API_ENDPOINT (e.g., "https://sellingpartnerapi-na.amazon.com")
-
+# Required ENV
 REQUIRED_ENVS = [
     "LWA_CLIENT_ID",
     "LWA_CLIENT_SECRET",
@@ -50,9 +37,11 @@ for k in REQUIRED_ENVS:
 LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET", "")
 LWA_REFRESH_TOKEN = os.getenv("LWA_REFRESH_TOKEN", "")
+
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
+
 SELLER_ID = os.getenv("SELLER_ID", "")
 REGION = os.getenv("REGION", "us-east-1")
 SP_API_ENDPOINT = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
@@ -63,7 +52,7 @@ app = FastAPI(title=APP_NAME)
 
 
 # ---------------------------
-# Helpers: LWA + SigV4
+# LWA + SigV4 helpers
 # ---------------------------
 def get_lwa_access_token() -> str:
     """Exchange refresh token for a short-lived LWA access token."""
@@ -81,11 +70,11 @@ def get_lwa_access_token() -> str:
     return r.json()["access_token"]
 
 
-def _sign(key, msg):
+def _sign(key: bytes, msg: str) -> bytes:
     return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _get_signature_key(key, date_stamp, region_name, service_name):
+def _get_signature_key(key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
     k_date = _sign(("AWS4" + key).encode("utf-8"), date_stamp)
     k_region = hmac.new(k_date, region_name.encode("utf-8"), hashlib.sha256).digest()
     k_service = hmac.new(k_region, service_name.encode("utf-8"), hashlib.sha256).digest()
@@ -95,7 +84,7 @@ def _get_signature_key(key, date_stamp, region_name, service_name):
 
 def execute_signed_request(method: str, path: str, query: str = "", body: Optional[str] = None, extra_headers: Optional[dict] = None):
     """
-    Minimal SigV4 signer for SP-API. Use this with your LWA bearer token.
+    Minimal SigV4 signer for SP-API.
     """
     if extra_headers is None:
         extra_headers = {}
@@ -112,19 +101,17 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
 
     payload_hash = hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
-    # Required headers
+    # Headers used in signing
     headers = {
         "host": host,
         "x-amz-date": amz_date,
         "x-amz-access-token": access_token,
         "content-type": extra_headers.get("content-type", "application/json"),
     }
-
-    # Merge any extras (without overwriting required unless intended)
     for k, v in (extra_headers or {}).items():
         headers[k.lower()] = v
 
-    signed_headers = ";".join(sorted([h for h in headers.keys()]))
+    signed_headers = ";".join(sorted(headers.keys()))
     canonical_headers = "".join([f"{h}:{headers[h]}\n" for h in sorted(headers.keys())])
 
     canonical_request = "\n".join([
@@ -153,8 +140,7 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
         f"SignedHeaders={signed_headers}, Signature={signature}"
     )
 
-    # Final headers (requests expects original case on common keys)
-    final_headers = {k if k.lower() != "host" else "host": v for k, v in headers.items()}
+    final_headers = {("host" if k.lower() == "host" else k): v for k, v in headers.items()}
     final_headers["Authorization"] = authorization_header
     if AWS_SESSION_TOKEN:
         final_headers["x-amz-security-token"] = AWS_SESSION_TOKEN
@@ -168,21 +154,16 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
 
 
 # ---------------------------
-# Feed Helpers (JSON feed flow)
+# Feed helpers (JSON_LISTINGS_FEED)
 # ---------------------------
 class PriceUpdatePayload(BaseModel):
-    sku: str = Field(..., description="Seller SKU you want to update")
+    sku: str = Field(..., description="Seller SKU")
     marketplaceId: str = Field(..., description="e.g., ATVPDKIKX0DER (US)")
-    amount: float = Field(..., description="New price amount, e.g., 36.99")
-    currency: str = Field(default="USD", description="Currency code (default USD)")
+    amount: float = Field(..., description="New price, e.g., 36.99")
+    currency: str = Field(default="USD", description="Currency code")
 
 
 def build_json_listings_price_feed(sku: str, marketplace_id: str, amount: float, currency: str = "USD") -> str:
-    """
-    Minimal JSON feed to PATCH price via JSON_LISTINGS_FEED.
-    NOTE: Amazon’s JSON feed structure can vary by productType. This uses a generic PATCH
-    to /attributes/standard_price. If your catalog needs a different path, we can tweak fast.
-    """
     message = {
         "sku": sku,
         "operationType": "PATCH",
@@ -192,32 +173,20 @@ def build_json_listings_price_feed(sku: str, marketplace_id: str, amount: float,
                 "op": "replace",
                 "path": "/attributes/standard_price",
                 "value": [
-                    {
-                        "currency": currency,
-                        "amount": round(float(amount), 2)
-                    }
+                    {"currency": currency, "amount": round(float(amount), 2)}
                 ]
             }
         ]
     }
-
     feed = {
-        "header": {
-            "sellerId": SELLER_ID,
-            "version": "2.0"
-        },
+        "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [message]
     }
-
-    # Amazon requires a top-level "marketplaceIds" when creating the feed
-    # (passed during /feeds create call), not inside the document.
     return json.dumps(feed, separators=(",", ":"))
 
 
 def create_feed_document() -> dict:
-    body = json.dumps({
-        "contentType": "application/json; charset=UTF-8"
-    })
+    body = json.dumps({"contentType": "application/json; charset=UTF-8"})
     resp = execute_signed_request(
         "POST",
         "/feeds/2021-06-30/documents",
@@ -230,9 +199,6 @@ def create_feed_document() -> dict:
 
 
 def upload_feed_to_s3(url: str, feed_body: str, content_type: str = "application/json; charset=UTF-8"):
-    """
-    JSON feeds use a pre-signed URL; no client-side encryption required.
-    """
     put = requests.put(url, data=feed_body.encode("utf-8"), headers={"Content-Type": content_type}, timeout=60)
     if put.status_code not in (200, 201):
         raise HTTPException(status_code=put.status_code, detail=f"S3 upload failed: {put.text}")
@@ -256,10 +222,7 @@ def create_feed(feed_document_id: str, feed_type: str, marketplace_ids: list[str
 
 
 def get_feed(feed_id: str) -> dict:
-    resp = execute_signed_request(
-        "GET",
-        f"/feeds/2021-06-30/feeds/{feed_id}"
-    )
+    resp = execute_signed_request("GET", f"/feeds/2021-06-30/feeds/{feed_id}")
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"getFeed failed: {resp.text}")
     return resp.json()
@@ -268,69 +231,70 @@ def get_feed(feed_id: str) -> dict:
 # ---------------------------
 # Routes
 # ---------------------------
+@app.get("/")
+def root():
+    return {"ok": True}
+
 @app.get("/health")
 def health():
-    return {
-        "app": APP_NAME,
-        "status": "ok",
-        "time_utc": dt.datetime.utcnow().isoformat() + "Z"
-    }
+    return {"app": APP_NAME, "status": "ok", "time_utc": dt.datetime.utcnow().isoformat() + "Z"}
 
+@app.get("/diag/lwa")
+def diag_lwa():
+    """
+    Direct LWA exchange to verify that LWA_CLIENT_ID/SECRET match LWA_REFRESH_TOKEN.
+    """
+    try:
+        r = requests.post(
+            "https://api.amazon.com/auth/o2/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": os.getenv("LWA_REFRESH_TOKEN",""),
+                "client_id": os.getenv("LWA_CLIENT_ID",""),
+                "client_secret": os.getenv("LWA_CLIENT_SECRET",""),
+            },
+            timeout=30
+        )
+        ct = r.headers.get("content-type","")
+        body = r.json() if "application/json" in ct else r.text
+        return {"status": r.status_code, "body": body}
+    except Exception as e:
+        return {"status": "error", "body": str(e)}
 
 @app.post("/update-price-fast")
 def update_price_fast(payload: PriceUpdatePayload):
     """
     Submit a JSON_LISTINGS_FEED to update price for a single SKU.
-    Returns feedId so you can poll /feed-status.
+    Returns feedId to poll with /feed-status.
     """
-    # 1) Build JSON feed body
     feed_body = build_json_listings_price_feed(
         sku=payload.sku,
         marketplace_id=payload.marketplaceId,
         amount=payload.amount,
         currency=payload.currency
     )
-
-    # 2) Create feed document
     doc = create_feed_document()
     feed_doc_id = doc["feedDocumentId"]
     upload_url = doc["url"]
 
-    # 3) Upload feed JSON to S3
     upload_feed_to_s3(upload_url, feed_body)
 
-    # 4) Create feed
     created = create_feed(
         feed_document_id=feed_doc_id,
         feed_type="JSON_LISTINGS_FEED",
         marketplace_ids=[payload.marketplaceId]
     )
-
     return {
         "status": "submitted",
         "feedId": created.get("feedId"),
         "feedDocumentId": feed_doc_id,
-        "note": "Use /feed-status?feedId=... to poll for DONE."
+        "note": "Use /feed-status?feedId=... until DONE."
     }
-
 
 @app.get("/feed-status")
 def feed_status(feedId: str = Query(..., description="Feed ID to check")):
-    status = get_feed(feedId)
-    return status
+    return get_feed(feedId)
 
-
-# OPTIONAL: Simple OAuth callback catcher so you can see Amazon redirect params when support fixes the blank page.
-# Set your redirect URI in the Security Profile to: https://<your-app-domain>/oauth/callback
 @app.get("/oauth/callback")
 def oauth_callback(code: Optional[str] = None, state: Optional[str] = None, selling_partner_id: Optional[str] = None):
-    """
-    This endpoint doesn't exchange the code (you’ll do that in Seller Central flow),
-    but it helps verify that the redirect works and you’re receiving a ?code=... back.
-    """
-    return {
-        "received": True,
-        "code": code,
-        "state": state,
-        "selling_partner_id": selling_partner_id
-    }
+    return {"received": True, "code": code, "state": state, "selling_partner_id": selling_partner_id}
