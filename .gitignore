@@ -1,0 +1,23 @@
+# --- secrets (keep first) ---
+.env
+.env.*
+*.pem
+*.key
+
+# --- Python build junk ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+.envrc
+.venv/
+venv/
+dist/
+build/
+
+# --- OS/editor noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
