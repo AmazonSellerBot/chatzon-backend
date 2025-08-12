@@ -12,9 +12,6 @@ import requests
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-# ---------------------------
-# App setup & logging
-# ---------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chatzon")
 APP_NAME = "Chatzon SP-API Bridge"
@@ -41,9 +38,6 @@ SERVICE = "execute-api"
 
 app = FastAPI(title=APP_NAME)
 
-# ---------------------------
-# LWA + SigV4 helpers
-# ---------------------------
 def get_lwa_access_token() -> str:
     r = requests.post(
         "https://api.amazon.com/auth/o2/token",
@@ -61,8 +55,7 @@ def get_lwa_access_token() -> str:
     return r.json()["access_token"]
 
 def _sign(key: bytes, msg: str) -> bytes:
-    import hmac as _h
-    import hashlib as _hs
+    import hmac as _h, hashlib as _hs
     return _h.new(key, msg.encode("utf-8"), _hs.sha256).digest()
 
 def _get_signature_key(key: str, date_stamp: str, region_name: str, service_name: str) -> bytes:
@@ -84,15 +77,21 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
     host = SP_API_ENDPOINT.replace("https://","").replace("http://","")
     canonical_uri = path
     canonical_querystring = query or ""
-    payload_hash = hashlib.sha256((body or "").encode("utf-8")).hexdigest()
+    payload = (body or "")
+    payload_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
+    # Build headers (do NOT send Content-Type for GET/HEAD with empty body)
     headers = {
         "host": host,
         "x-amz-date": amz_date,
         "x-amz-access-token": access_token,
-        "content-type": extra_headers.get("content-type","application/json"),
+        "accept": "application/json",
     }
-    for k,v in (extra_headers or {}).items():
+    # Only include content-type if we actually send a body
+    if payload:
+        headers["content-type"] = extra_headers.get("content-type", "application/json")
+    # Merge any additional headers (lowercased keys)
+    for k, v in (extra_headers or {}).items():
         headers[k.lower()] = v
 
     signed_headers = ";".join(sorted(headers.keys()))
@@ -124,11 +123,8 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
     if canonical_querystring:
         url += f"?{canonical_querystring}"
 
-    return requests.request(method, url, headers=final_headers, data=(body or ""), timeout=60)
+    return requests.request(method, url, headers=final_headers, data=payload, timeout=60)
 
-# ---------------------------
-# Feed helpers
-# ---------------------------
 class PriceUpdatePayload(BaseModel):
     sku: str
     marketplaceId: str
@@ -174,7 +170,6 @@ def create_feed(feed_document_id: str, feed_type: str, marketplace_ids: list[str
 def get_feed(feed_id: str) -> dict:
     resp = execute_signed_request("GET", f"/feeds/2021-06-30/feeds/{feed_id}")
     if resp.status_code == 404 or (resp.status_code != 200 and "NotFound" in resp.text):
-        # Fallback: some accounts only resolve via listFeeds with feedIds filter
         q = f"feedIds={feed_id}"
         alt = execute_signed_request("GET", "/feeds/2021-06-30/feeds", query=q)
         if alt.status_code == 200 and alt.json().get("feeds"):
@@ -203,15 +198,13 @@ def download_processing_report(url: str, compression_algorithm: Optional[str]) -
         raise HTTPException(status_code=r.status_code, detail=f"download report failed: {r.text}")
     content = r.content
     if (compression_algorithm or "").upper() == "GZIP":
-        content = gzip.decompress(content)
+        import gzip as _gz
+        content = _gz.decompress(content)
     try:
         return json.loads(content.decode("utf-8"))
     except Exception:
         return content.decode("utf-8", errors="replace")
 
-# ---------------------------
-# Routes
-# ---------------------------
 @app.get("/")
 def root(): return {"ok": True}
 
@@ -271,7 +264,7 @@ def feed_report(feedId: str = Query(...)):
 
 @app.get("/feed-report-by-doc")
 def feed_report_by_doc(docId: str = Query(...)):
-    doc = get_feed_document(docId)
+    doc = get_feed_document(docId.strip())
     return {"feedDocumentId": docId, "compression": doc.get("compressionAlgorithm"), "report": download_processing_report(doc["url"], doc.get("compressionAlgorithm"))}
 
 @app.get("/oauth/callback")
