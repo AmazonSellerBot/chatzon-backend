@@ -2,6 +2,8 @@
 import os
 import hmac
 import json
+import gzip
+import io
 import hashlib
 import logging
 import datetime as dt
@@ -18,7 +20,6 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chatzon")
 APP_NAME = "Chatzon SP-API Bridge"
 
-# Required ENV
 REQUIRED_ENVS = [
     "LWA_CLIENT_ID",
     "LWA_CLIENT_SECRET",
@@ -29,7 +30,6 @@ REQUIRED_ENVS = [
     "REGION",
     "SP_API_ENDPOINT",
 ]
-
 for k in REQUIRED_ENVS:
     if not os.getenv(k):
         log.warning(f"ENV {k} is not set")
@@ -37,15 +37,12 @@ for k in REQUIRED_ENVS:
 LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET", "")
 LWA_REFRESH_TOKEN = os.getenv("LWA_REFRESH_TOKEN", "")
-
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "")
-
 SELLER_ID = os.getenv("SELLER_ID", "")
 REGION = os.getenv("REGION", "us-east-1")
 SP_API_ENDPOINT = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
-
 SERVICE = "execute-api"
 
 app = FastAPI(title=APP_NAME)
@@ -55,7 +52,6 @@ app = FastAPI(title=APP_NAME)
 # LWA + SigV4 helpers
 # ---------------------------
 def get_lwa_access_token() -> str:
-    """Exchange refresh token for a short-lived LWA access token."""
     url = "https://api.amazon.com/auth/o2/token"
     data = {
         "grant_type": "refresh_token",
@@ -83,9 +79,6 @@ def _get_signature_key(key: str, date_stamp: str, region_name: str, service_name
 
 
 def execute_signed_request(method: str, path: str, query: str = "", body: Optional[str] = None, extra_headers: Optional[dict] = None):
-    """
-    Minimal SigV4 signer for SP-API.
-    """
     if extra_headers is None:
         extra_headers = {}
 
@@ -98,10 +91,8 @@ def execute_signed_request(method: str, path: str, query: str = "", body: Option
     host = SP_API_ENDPOINT.replace("https://", "").replace("http://", "")
     canonical_uri = path
     canonical_querystring = query or ""
-
     payload_hash = hashlib.sha256((body or "").encode("utf-8")).hexdigest()
 
-    # Headers used in signing
     headers = {
         "host": host,
         "x-amz-date": amz_date,
@@ -216,8 +207,9 @@ def create_feed(feed_document_id: str, feed_type: str, marketplace_ids: list[str
         body=body,
         extra_headers={"content-type": "application/json; charset=UTF-8"}
     )
-    if resp.status_code not in (200, 201):
+    if resp.status_code not in (200, 201, 202):
         raise HTTPException(status_code=resp.status_code, detail=f"createFeed failed: {resp.text}")
+    # 202 Accepted returns {"feedId":"..."}
     return resp.json()
 
 
@@ -226,6 +218,38 @@ def get_feed(feed_id: str) -> dict:
     if resp.status_code != 200:
         raise HTTPException(status_code=resp.status_code, detail=f"getFeed failed: {resp.text}")
     return resp.json()
+
+
+def list_recent_feeds(max_results: int = 20, feed_type: str = "JSON_LISTINGS_FEED") -> dict:
+    created_since = (dt.datetime.utcnow() - dt.timedelta(days=2)).replace(microsecond=0).isoformat() + "Z"
+    q = f"maxResults={max_results}&createdSince={created_since}&feedTypes={feed_type}"
+    resp = execute_signed_request("GET", "/feeds/2021-06-30/feeds", query=q)
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"listFeeds failed: {resp.text}")
+    return resp.json()
+
+
+def get_feed_document(feed_document_id: str) -> dict:
+    resp = execute_signed_request("GET", f"/feeds/2021-06-30/documents/{feed_document_id}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"getFeedDocument failed: {resp.text}")
+    return resp.json()
+
+
+def download_processing_report(url: str, compression_algorithm: Optional[str]) -> dict | str:
+    r = requests.get(url, timeout=60)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=f"download report failed: {r.text}")
+
+    content = r.content
+    if (compression_algorithm or "").upper() == "GZIP":
+        content = gzip.decompress(content)
+
+    # Try JSON first; if not JSON, return text
+    try:
+        return json.loads(content.decode("utf-8"))
+    except Exception:
+        return content.decode("utf-8", errors="replace")
 
 
 # ---------------------------
@@ -241,9 +265,6 @@ def health():
 
 @app.get("/diag/lwa")
 def diag_lwa():
-    """
-    Direct LWA exchange to verify that LWA_CLIENT_ID/SECRET match LWA_REFRESH_TOKEN.
-    """
     try:
         r = requests.post(
             "https://api.amazon.com/auth/o2/token",
@@ -261,11 +282,19 @@ def diag_lwa():
     except Exception as e:
         return {"status": "error", "body": str(e)}
 
-@app.post("/update-price-fast")
+
+class PriceUpdateResponse(BaseModel):
+    status: str
+    feedId: Optional[str] = None
+    feedDocumentId: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.post("/update-price-fast", response_model=PriceUpdateResponse)
 def update_price_fast(payload: PriceUpdatePayload):
     """
     Submit a JSON_LISTINGS_FEED to update price for a single SKU.
-    Returns feedId to poll with /feed-status.
+    Returns feedId to poll with /feed-status and report with /feed-report.
     """
     feed_body = build_json_listings_price_feed(
         sku=payload.sku,
@@ -273,6 +302,7 @@ def update_price_fast(payload: PriceUpdatePayload):
         amount=payload.amount,
         currency=payload.currency
     )
+
     doc = create_feed_document()
     feed_doc_id = doc["feedDocumentId"]
     upload_url = doc["url"]
@@ -284,16 +314,42 @@ def update_price_fast(payload: PriceUpdatePayload):
         feed_type="JSON_LISTINGS_FEED",
         marketplace_ids=[payload.marketplaceId]
     )
-    return {
-        "status": "submitted",
-        "feedId": created.get("feedId"),
-        "feedDocumentId": feed_doc_id,
-        "note": "Use /feed-status?feedId=... until DONE."
-    }
+    return PriceUpdateResponse(
+        status="submitted",
+        feedId=created.get("feedId"),
+        feedDocumentId=feed_doc_id,
+        note="Use /feed-status?feedId=... until DONE, then call /feed-report?feedId=..."
+    )
+
 
 @app.get("/feed-status")
 def feed_status(feedId: str = Query(..., description="Feed ID to check")):
     return get_feed(feedId)
+
+
+@app.get("/feeds/recent")
+def feeds_recent(maxResults: int = Query(20, ge=1, le=100), feedType: str = "JSON_LISTINGS_FEED"):
+    return list_recent_feeds(max_results=maxResults, feed_type=feedType)
+
+
+@app.get("/feed-report")
+def feed_report(feedId: str = Query(..., description="Feed ID whose processing report to fetch")):
+    """
+    After a feed is DONE, this returns the processing report (JSON or text).
+    """
+    info = get_feed(feedId)
+    result_doc_id = info.get("resultFeedDocumentId")
+    if not result_doc_id:
+        raise HTTPException(status_code=400, detail="Feed not DONE yet or no resultFeedDocumentId present.")
+
+    doc = get_feed_document(result_doc_id)
+    url = doc.get("url")
+    comp = doc.get("compressionAlgorithm")
+    if not url:
+        raise HTTPException(status_code=500, detail="No URL in feed document.")
+    report = download_processing_report(url, comp)
+    return {"feedId": feedId, "compression": comp, "report": report}
+
 
 @app.get("/oauth/callback")
 def oauth_callback(code: Optional[str] = None, state: Optional[str] = None, selling_partner_id: Optional[str] = None):
