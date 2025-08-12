@@ -11,6 +11,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("chatzon")
 APP_NAME = "Chatzon SP-API Bridge"
 
+# Required envs
 for k in ["LWA_CLIENT_ID","LWA_CLIENT_SECRET","LWA_REFRESH_TOKEN","AWS_ACCESS_KEY_ID","AWS_SECRET_ACCESS_KEY","SELLER_ID","REGION","SP_API_ENDPOINT"]:
     if not os.getenv(k): log.warning(f"ENV {k} is not set")
 
@@ -22,14 +23,17 @@ SERVICE="execute-api"
 
 app = FastAPI(title=APP_NAME)
 
+# ---------- LWA ----------
 def get_lwa_access_token()->str:
     r=requests.post("https://api.amazon.com/auth/o2/token",data={
         "grant_type":"refresh_token","refresh_token":LWA_REFRESH_TOKEN,"client_id":LWA_CLIENT_ID,"client_secret":LWA_CLIENT_SECRET
     },timeout=30)
     if r.status_code!=200:
-        log.error(f"LWA token error: {r.status_code} {r.text}"); raise HTTPException(500,"Failed to obtain LWA access token")
+        log.error(f"LWA token error: {r.status_code} {r.text}")
+        raise HTTPException(500,"Failed to obtain LWA access token")
     return r.json()["access_token"]
 
+# ---------- SigV4 ----------
 def _sign(key:bytes,msg:str)->bytes:
     import hashlib as _hs; return hmac.new(key,msg.encode("utf-8"),_hs.sha256).digest()
 
@@ -43,17 +47,22 @@ def _get_signature_key(key:str,date_stamp:str,region_name:str,service_name:str)-
 def execute_signed_request(method:str,path:str,query:str="",body:Optional[str]=None,extra_headers:Optional[dict]=None):
     extra_headers=extra_headers or {}
     access_token=get_lwa_access_token()
+
     t=dt.datetime.utcnow(); amz_date=t.strftime("%Y%m%dT%H%M%SZ"); date_stamp=t.strftime("%Y%m%d")
     host=SP_API_ENDPOINT.replace("https://","").replace("http://","")
-    # IMPORTANT: URL-encode the path for SigV4
+
+    # IMPORTANT: encode the path for canonical string AND for the request URL
     canonical_uri = quote(path, safe="/-_.~")
     canonical_querystring=query or ""
-    payload=(body or ""); payload_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    payload=(body or "")
+    payload_hash=hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    # Only send minimal headers for GET; include content-type only when sending a body
+    # Minimal headers (Amazon rejects extra on some GETs)
     headers={"host":host,"x-amz-date":amz_date,"x-amz-access-token":access_token}
-    if payload: headers["content-type"]=extra_headers.get("content-type","application/json")
-    for k,v in extra_headers.items(): headers[k.lower()]=v
+    if payload:
+        headers["content-type"]=extra_headers.get("content-type","application/json")
+    for k,v in extra_headers.items():
+        headers[k.lower()]=v
 
     signed_headers=";".join(sorted(headers.keys()))
     canonical_headers="".join([f"{h}:{headers[h]}\n" for h in sorted(headers.keys())])
@@ -68,10 +77,13 @@ def execute_signed_request(method:str,path:str,query:str="",body:Optional[str]=N
     final_headers["Authorization"]=f"{algorithm} Credential={AWS_ACCESS_KEY_ID}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"
     if AWS_SESSION_TOKEN: final_headers["x-amz-security-token"]=AWS_SESSION_TOKEN
 
-    url=f"{SP_API_ENDPOINT}{path}"; 
+    # Use the **encoded** path in the actual request URL too
+    url=f"{SP_API_ENDPOINT}{canonical_uri}"
     if canonical_querystring: url+=f"?{canonical_querystring}"
+
     return requests.request(method,url,headers=final_headers,data=payload,timeout=60)
 
+# ---------- Feeds helpers ----------
 class PriceUpdatePayload(BaseModel):
     sku:str; marketplaceId:str; amount:float; currency:str="USD"
 
@@ -80,7 +92,9 @@ def build_json_listings_price_feed(sku:str,marketplace_id:str,amount:float,curre
     return json.dumps({"header":{"sellerId":SELLER_ID,"version":"2.0"},"messages":[msg]},separators=(",",":"))
 
 def create_feed_document()->dict:
-    r=execute_signed_request("POST","/feeds/2021-06-30/documents",body=json.dumps({"contentType":"application/json; charset=UTF-8"}),extra_headers={"content-type":"application/json; charset=UTF-8"})
+    r=execute_signed_request("POST","/feeds/2021-06-30/documents",
+        body=json.dumps({"contentType":"application/json; charset=UTF-8"}),
+        extra_headers={"content-type":"application/json; charset=UTF-8"})
     if r.status_code not in (200,201): raise HTTPException(r.status_code,f"createFeedDocument failed: {r.text}")
     return r.json()
 
@@ -89,7 +103,9 @@ def upload_feed_to_s3(url:str,feed_body:str,content_type:str="application/json; 
     if put.status_code not in (200,201): raise HTTPException(put.status_code,f"S3 upload failed: {put.text}")
 
 def create_feed(feed_document_id:str,feed_type:str,marketplace_ids:list[str])->dict:
-    r=execute_signed_request("POST","/feeds/2021-06-30/feeds",body=json.dumps({"feedType":feed_type,"marketplaceIds":marketplace_ids,"inputFeedDocumentId":feed_document_id}),extra_headers={"content-type":"application/json; charset=UTF-8"})
+    r=execute_signed_request("POST","/feeds/2021-06-30/feeds",
+        body=json.dumps({"feedType":feed_type,"marketplaceIds":marketplace_ids,"inputFeedDocumentId":feed_document_id}),
+        extra_headers={"content-type":"application/json; charset=UTF-8"})
     if r.status_code not in (200,201,202): raise HTTPException(r.status_code,f"createFeed failed: {r.text}")
     return r.json()
 
@@ -108,7 +124,6 @@ def list_recent_feeds(max_results:int=20,feed_type:str="JSON_LISTINGS_FEED")->di
     return r.json()
 
 def get_feed_document(feed_document_id:str)->dict:
-    # ensure path segment is encoded for signing, but original path string is correct
     r=execute_signed_request("GET",f"/feeds/2021-06-30/documents/{feed_document_id}")
     if r.status_code!=200: raise HTTPException(r.status_code,f"getFeedDocument failed: {r.text}")
     return r.json()
@@ -117,10 +132,12 @@ def download_processing_report(url:str,compression_algorithm:Optional[str])->dic
     r=requests.get(url,timeout=60)
     if r.status_code!=200: raise HTTPException(r.status_code,f"download report failed: {r.text}")
     content=r.content
-    if (compression_algorithm or "").upper()=="GZIP": content=gzip.decompress(content)
+    if (compression_algorithm or "").upper()=="GZIP":
+        content=gzip.decompress(content)
     try: return json.loads(content.decode("utf-8"))
     except Exception: return content.decode("utf-8",errors="replace")
 
+# ---------- Routes ----------
 @app.get("/")
 def root(): return {"ok": True}
 
@@ -130,7 +147,8 @@ def health(): return {"app":APP_NAME,"status":"ok","time_utc":dt.datetime.utcnow
 @app.get("/diag/lwa")
 def diag_lwa():
     r=requests.post("https://api.amazon.com/auth/o2/token",data={
-        "grant_type":"refresh_token","refresh_token":os.getenv("LWA_REFRESH_TOKEN",""),"client_id":os.getenv("LWA_CLIENT_ID",""),"client_secret":os.getenv("LWA_CLIENT_SECRET","")
+        "grant_type":"refresh_token","refresh_token":os.getenv("LWA_REFRESH_TOKEN",""),
+        "client_id":os.getenv("LWA_CLIENT_ID",""),"client_secret":os.getenv("LWA_CLIENT_SECRET","")
     },timeout=30)
     ct=r.headers.get("content-type",""); body=r.json() if "application/json" in ct else r.text
     return {"status":r.status_code,"body":body}
