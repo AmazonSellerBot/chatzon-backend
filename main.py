@@ -11,11 +11,11 @@ app = FastAPI(title="Chatzon SP-API Bridge")
 REGION            = os.getenv("REGION", "us-east-1")
 SP_API_ENDPOINT   = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
 MARKETPLACE_ID    = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
-SELLER_ID         = os.getenv("SPAPI_SELLER_ID") or os.getenv("SELLER_ID")
+SELLER_ID         = os.getenv("SELLER_ID") or os.getenv("SPAPI_SELLER_ID")
 
-AWS_KEY           = os.getenv("SPAPI_AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET        = os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("SPAPI_AWS_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN")  # optional
+AWS_KEY           = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
+AWS_SECRET        = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN") or os.getenv("SPAPI_AWS_SESSION_TOKEN")  # optional
 
 LWA_CLIENT_ID     = os.getenv("LWA_CLIENT_ID")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
@@ -81,19 +81,18 @@ def _sign(host: str, method: str, path: str, query: str, body_bytes: bytes, amz_
     return headers, auth_header
 
 def sp_api_request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None, access_token: str | None = None):
-    _require(("SPAPI_AWS_ACCESS_KEY_ID", AWS_KEY), ("SPAPI_AWS_SECRET_ACCESS_KEY", AWS_SECRET))
+    _require(("AWS_ACCESS_KEY_ID", AWS_KEY), ("AWS_SECRET_ACCESS_KEY", AWS_SECRET))
     urlp = urlparse(SP_API_ENDPOINT)
     host = urlp.netloc
     query_str = urlencode(params or {}, doseq=True)
     full_url = f"{SP_API_ENDPOINT}{path}" + (f"?{query_str}" if query_str else "")
 
+    # Only send Content-Type when there is a body (Amazon can reject it on GET)
     body_bytes = b""
-    headers_base = {
-        "content-type": "application/json; charset=UTF-8",
-        "accept": "application/json",
-    }
+    headers_base = {"accept": "application/json"}
     if json_body is not None:
         body_bytes = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
+        headers_base["content-type"] = "application/json; charset=UTF-8"
 
     now = datetime.datetime.utcnow()
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -144,7 +143,7 @@ def create_feed(access_token: str, marketplace_id: str, feed_document_id: str):
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
-# ---- Price update (fixed schema)
+# ---- Price update (fixed JSON_LISTINGS_FEED schema)
 @app.post("/update-price-fast")
 def update_price_fast(payload: dict = Body(...)):
     """
@@ -159,15 +158,7 @@ def update_price_fast(payload: dict = Body(...)):
     """
     token = get_lwa_access_token()
     sku = payload["sku"]
-    marketplace_id = payload.get("marketplaceId") or MARKETINGPLACE_ID if (MARKETINGPLACE_ID := None) else payload.get("marketplaceId")  # safeguard
-    marketplace_id = marketplace_id or MARKETINGPLACE_ID or MARKETINGPLACE_ID  # keep original behavior
-    # Fallback to env default if above guard got weird:
-    if not marketplace_id:
-        marketplace_id = MARKETINGPLACE_ID if 'MARKETINGPLACE_ID' in globals() else MARKETINGPLACE_ID if 'MARKETINGPLACE_ID' in locals() else MARKT := None or MARKT
-
-    # Proper simple assignment (ignore the guards above if confusing):
-    marketplace_id = payload.get("marketplaceId") or MARKT or os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
-
+    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
     amount = float(payload["amount"])
     currency = payload.get("currency", "USD")
     product_type = payload.get("productType", "PRODUCT")
@@ -184,7 +175,7 @@ def update_price_fast(payload: dict = Body(...)):
                 "path": "/attributes/standard_price",
                 "value": [{
                     "marketplace_id": marketplace_id,
-                    "value": { "currency": currency, "amount": amount }
+                    "value": {"currency": currency, "amount": amount}
                 }]
             }]
         }]
