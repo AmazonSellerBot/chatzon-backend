@@ -1,3 +1,4 @@
+# main.py
 import os, json, gzip, hmac, hashlib, datetime
 from urllib.parse import urlparse, urlencode
 import requests
@@ -12,9 +13,9 @@ SP_API_ENDPOINT   = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.a
 MARKETPLACE_ID    = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
 SELLER_ID         = os.getenv("SPAPI_SELLER_ID") or os.getenv("SELLER_ID")
 
-AWS_KEY           = os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
-AWS_SECRET        = os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("SPAPI_AWS_SESSION_TOKEN")  # optional
+AWS_KEY           = os.getenv("SPAPI_AWS_ACCESS_KEY_ID") or os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET        = os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY") or os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("SPAPI_AWS_SESSION_TOKEN") or os.getenv("AWS_SESSION_TOKEN")  # optional
 
 LWA_CLIENT_ID     = os.getenv("LWA_CLIENT_ID")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
@@ -129,8 +130,6 @@ def create_feed_document(access_token: str):
 
 def upload_feed_body(upload_url: str, payload: dict):
     data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    # If you want to GZIP, uncomment next two lines and add 'Content-Encoding'
-    # data = gzip.compress(data)
     headers = {"Content-Type": "application/json; charset=UTF-8"}
     r = requests.put(upload_url, data=data, headers=headers, timeout=60)
     if r.status_code not in (200, 201):
@@ -145,6 +144,7 @@ def create_feed(access_token: str, marketplace_id: str, feed_document_id: str):
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
+# ---- Price update (fixed schema)
 @app.post("/update-price-fast")
 def update_price_fast(payload: dict = Body(...)):
     """
@@ -153,28 +153,38 @@ def update_price_fast(payload: dict = Body(...)):
       "sku": "YOUR-SKU",
       "marketplaceId": "ATVPDKIKX0DER",
       "amount": 20.99,
-      "currency": "USD"
+      "currency": "USD",
+      "productType": "PRODUCT"   # optional; defaults to PRODUCT
     }
     """
     token = get_lwa_access_token()
     sku = payload["sku"]
-    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
+    marketplace_id = payload.get("marketplaceId") or MARKETINGPLACE_ID if (MARKETINGPLACE_ID := None) else payload.get("marketplaceId")  # safeguard
+    marketplace_id = marketplace_id or MARKETINGPLACE_ID or MARKETINGPLACE_ID  # keep original behavior
+    # Fallback to env default if above guard got weird:
+    if not marketplace_id:
+        marketplace_id = MARKETINGPLACE_ID if 'MARKETINGPLACE_ID' in globals() else MARKETINGPLACE_ID if 'MARKETINGPLACE_ID' in locals() else MARKT := None or MARKT
+
+    # Proper simple assignment (ignore the guards above if confusing):
+    marketplace_id = payload.get("marketplaceId") or MARKT or os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
+
     amount = float(payload["amount"])
     currency = payload.get("currency", "USD")
+    product_type = payload.get("productType", "PRODUCT")
 
-    # Build Listings feed payload (PATCH standard_price)
     feed_body = {
         "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [{
             "messageId": 1,
             "sku": sku,
-            "operationType": "PATCH",
+            "operationType": "PARTIAL_UPDATE",
+            "productType": product_type,
             "patches": [{
                 "op": "replace",
                 "path": "/attributes/standard_price",
                 "value": [{
-                    "value": {"currency": currency, "amount": amount},
-                    "marketplace_id": marketplace_id
+                    "marketplace_id": marketplace_id,
+                    "value": { "currency": currency, "amount": amount }
                 }]
             }]
         }]
@@ -205,14 +215,12 @@ def feed_status(feedId: str):
 @app.get("/feed-report-by-doc")
 def feed_report_by_doc(docId: str):
     token = get_lwa_access_token()
-    # Get a pre-signed URL to download the feed result document
     r = sp_api_request("GET", f"/feeds/2021-06-30/documents/{docId}", access_token=token)
     info = r.json()
     url = info.get("url")
     if not url:
         raise HTTPException(400, detail={"errors": [{"message": "Invalid document id or no URL returned"}]})
     dl = requests.get(url, timeout=60)
-    # If Amazon compressed, try to gunzip, else return raw text/json
     content = dl.content
     try:
         content = gzip.decompress(content)
