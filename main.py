@@ -85,7 +85,7 @@ def sp_api_request(method: str, path: str, *, params: dict | None = None, json_b
     query_str = urlencode(params or {}, doseq=True)
     full_url = f"{SP_API_ENDPOINT}{path}" + (f"?{query_str}" if query_str else "")
 
-    # Only send Content-Type when there is a body (Amazon can reject it on GET)
+    # Only send Content-Type when body exists (Amazon can reject it on GET)
     body_bytes = b""
     headers_base = {"accept": "application/json"}
     if json_body is not None:
@@ -106,7 +106,7 @@ def sp_api_request(method: str, path: str, *, params: dict | None = None, json_b
 
     resp = requests.request(method, full_url, headers=headers, data=body_bytes if body_bytes else None, timeout=60)
     if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": resp.text})
+        raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": r esp.text})
     return resp
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -141,7 +141,7 @@ def create_feed(access_token: str, marketplace_id: str, feed_document_id: str):
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
-# ── Price update (JSON_LISTINGS_FEED with attributes.standard_price) ──────────
+# ── Price update (JSON_LISTINGS_FEED with attributes.purchasable_offer) ───────
 @app.post("/update-price-fast")
 def update_price_fast(payload: dict = Body(...)):
     """
@@ -161,7 +161,7 @@ def update_price_fast(payload: dict = Body(...)):
     currency = payload.get("currency", "USD")
     product_type = payload.get("productType", "PRODUCT")
 
-    # Correct shape for price via JSON_LISTINGS_FEED
+    # Correct JSON Listings shape for price
     feed_body = {
         "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [{
@@ -170,12 +170,15 @@ def update_price_fast(payload: dict = Body(...)):
             "operationType": "UPDATE",
             "productType": product_type,
             "attributes": {
-                "standard_price": [
-                    {
-                        "marketplace_id": marketplace_id,
-                        "value": { "currency": currency, "amount": amount }
-                    }
-                ]
+                "purchasable_offer": [{
+                    "marketplace_id": marketplace_id,
+                    "currency": currency,
+                    "our_price": [{
+                        "schedule": [{
+                            "value_with_tax": {"amount": amount, "currency": currency}
+                        }]
+                    }]
+                }]
             }
         }]
     }
