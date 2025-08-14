@@ -106,7 +106,7 @@ def sp_api_request(method: str, path: str, *, params: dict | None = None, json_b
 
     resp = requests.request(method, full_url, headers=headers, data=body_bytes if body_bytes else None, timeout=60)
     if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": r esp.text})
+        raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": resp.text})
     return resp
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -120,30 +120,29 @@ def diag_lwa():
     return {"status": 200, "access_token_prefix": token[:12] + "...", "expires_in": 3600}
 
 # ── Feeds helpers ─────────────────────────────────────────────────────────────
-def create_feed_document(access_token: str):
-    body = {"contentType": "application/json; charset=UTF-8"}
+def create_feed_document(access_token: str, content_type: str):
+    body = {"contentType": content_type}
     r = sp_api_request("POST", "/feeds/2021-06-30/documents", json_body=body, access_token=access_token)
     return r.json()
 
-def upload_feed_body(upload_url: str, payload: dict):
-    data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    headers = {"Content-Type": "application/json; charset=UTF-8"}
-    r = requests.put(upload_url, data=data, headers=headers, timeout=60)
+def upload_feed_body(upload_url: str, data_bytes: bytes, content_type: str):
+    headers = {"Content-Type": content_type}
+    r = requests.put(upload_url, data=data_bytes, headers=headers, timeout=60)
     if r.status_code not in (200, 201):
         raise HTTPException(400, detail={"status": r.status_code, "body": r.text})
 
-def create_feed(access_token: str, marketplace_id: str, feed_document_id: str):
+def create_feed(access_token: str, marketplace_id: str, feed_document_id: str, feed_type: str):
     body = {
-        "feedType": "JSON_LISTINGS_FEED",
+        "feedType": feed_type,
         "marketplaceIds": [marketplace_id],
         "inputFeedDocumentId": feed_document_id,
     }
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
-# ── Price update (JSON_LISTINGS_FEED with attributes.purchasable_offer) ───────
-@app.post("/update-price-fast")
-def update_price_fast(payload: dict = Body(...)):
+# ── Price update via JSON_LISTINGS_FEED ───────────────────────────────────────
+@app.post("/update-price-json")
+def update_price_json(payload: dict = Body(...)):
     """
     Body:
     {
@@ -151,7 +150,7 @@ def update_price_fast(payload: dict = Body(...)):
       "marketplaceId": "ATVPDKIKX0DER",
       "amount": 20.99,
       "currency": "USD",
-      "productType": "PRODUCT"   # optional; defaults to PRODUCT
+      "productType": "PRODUCT"
     }
     """
     token = get_lwa_access_token()
@@ -161,8 +160,8 @@ def update_price_fast(payload: dict = Body(...)):
     currency = payload.get("currency", "USD")
     product_type = payload.get("productType", "PRODUCT")
 
-    # Correct JSON Listings shape for price
-    feed_body = {
+    # JSON listings shape using purchasable_offer
+    feed_json = {
         "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [{
             "messageId": 1,
@@ -183,19 +182,56 @@ def update_price_fast(payload: dict = Body(...)):
         }]
     }
 
-    doc = create_feed_document(token)
-    upload_feed_body(doc["url"], feed_body)
-    feed = create_feed(token, marketplace_id, doc["feedDocumentId"])
-    return {
-        "status": "submitted",
-        "feedId": feed.get("feedId"),
-        "feedDocumentId": doc.get("feedDocumentId"),
-        "note": "Use /feed-status?feedId=... until DONE, then /feed-report-by-doc?docId=..."
+    doc = create_feed_document(token, "application/json; charset=UTF-8")
+    upload_feed_body(doc["url"], json.dumps(feed_json, separators=(",", ":")).encode("utf-8"), "application/json; charset=UTF-8")
+    feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "JSON_LISTINGS_FEED")
+    return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
+
+# ── Price update via legacy XML (POST_PRODUCT_PRICING_DATA) ───────────────────
+def build_price_xml(sku: str, amount: float, currency: str) -> str:
+    # Minimal price feed per MWS/legacy schema
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">
+  <Header>
+    <DocumentVersion>1.01</DocumentVersion>
+    <MerchantIdentifier>{SELLER_ID or "UNKNOWN_SELLER"}</MerchantIdentifier>
+  </Header>
+  <MessageType>Price</MessageType>
+  <Message>
+    <MessageID>1</MessageID>
+    <Price>
+      <SKU>{sku}</SKU>
+      <StandardPrice currency="{currency}">{amount:.2f}</StandardPrice>
+    </Price>
+  </Message>
+</AmazonEnvelope>'''.strip()
+
+@app.post("/update-price-xml")
+def update_price_xml(payload: dict = Body(...)):
+    """
+    Body:
+    {
+      "sku": "YOUR-SKU",
+      "marketplaceId": "ATVPDKIKX0DER",
+      "amount": 20.99,
+      "currency": "USD"
     }
+    """
+    token = get_lwa_access_token()
+    sku = payload["sku"]
+    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
+    amount = float(payload["amount"])
+    currency = payload.get("currency", "USD")
+
+    xml_body = build_price_xml(sku, amount, currency)
+    doc = create_feed_document(token, "text/xml; charset=UTF-8")
+    upload_feed_body(doc["url"], xml_body.encode("utf-8"), "text/xml; charset=UTF-8")
+    feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "POST_PRODUCT_PRICING_DATA")
+    return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
 
 # ── Feed tracking ─────────────────────────────────────────────────────────────
 @app.get("/feeds/recent")
-def list_recent_feeds(maxResults: int = 3):
+def list_recent_feeds(maxResults: int = 5):
     token = get_lwa_access_token()
     r = sp_api_request("GET", "/feeds/2021-06-30/feeds", params={"maxResults": maxResults}, access_token=token)
     return r.json()
