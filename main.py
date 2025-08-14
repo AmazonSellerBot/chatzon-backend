@@ -4,18 +4,23 @@ from urllib.parse import urlparse, urlencode
 import requests
 from fastapi import FastAPI, HTTPException, Body
 
-# ---- App
+# ──────────────────────────────────────────────────────────────────────────────
+# App
+# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Chatzon SP-API Bridge")
 
-# ---- Env
+# ──────────────────────────────────────────────────────────────────────────────
+# Env
+# ──────────────────────────────────────────────────────────────────────────────
 REGION            = os.getenv("REGION", "us-east-1")
 SP_API_ENDPOINT   = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
 MARKETPLACE_ID    = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
 SELLER_ID         = os.getenv("SELLER_ID") or os.getenv("SPAPI_SELLER_ID")
 
-AWS_KEY           = os.getenv("AWS_ACCESS_KEY_ID") or os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
-AWS_SECRET        = os.getenv("AWS_SECRET_ACCESS_KEY") or os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN") or os.getenv("SPAPI_AWS_SESSION_TOKEN")  # optional
+# Support either AWS_* or SPAPI_AWS_* variable names
+AWS_KEY           = os.getenv("AWS_ACCESS_KEY_ID")        or os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
+AWS_SECRET        = os.getenv("AWS_SECRET_ACCESS_KEY")    or os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")        or os.getenv("SPAPI_AWS_SESSION_TOKEN")   # optional
 
 LWA_CLIENT_ID     = os.getenv("LWA_CLIENT_ID")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
@@ -26,7 +31,9 @@ def _require(*pairs):
     if missing:
         raise HTTPException(500, detail=f"Missing env vars: {', '.join(missing)}")
 
-# ---- LWA
+# ──────────────────────────────────────────────────────────────────────────────
+# LWA (refresh_token → access_token)
+# ──────────────────────────────────────────────────────────────────────────────
 def get_lwa_access_token():
     _require(
         ("LWA_CLIENT_ID", LWA_CLIENT_ID),
@@ -44,23 +51,22 @@ def get_lwa_access_token():
         raise HTTPException(400, detail={"status": r.status_code, "body": r.text})
     return r.json()["access_token"]
 
-# ---- SigV4
+# ──────────────────────────────────────────────────────────────────────────────
+# SigV4
+# ──────────────────────────────────────────────────────────────────────────────
 def _sign(host: str, method: str, path: str, query: str, body_bytes: bytes, amz_date: str, date_stamp: str):
     service = "execute-api"
     canonical_uri = path
     canonical_querystring = query or ""
     payload_hash = hashlib.sha256(body_bytes).hexdigest()
 
-    headers = {
-        "host": host,
-        "x-amz-date": amz_date,
-    }
+    headers = {"host": host, "x-amz-date": amz_date}
     signed_headers = "host;x-amz-date"
     if AWS_SESSION_TOKEN:
         headers["x-amz-security-token"] = AWS_SESSION_TOKEN
         signed_headers = "host;x-amz-date;x-amz-security-token"
 
-    canonical_headers = "".join([f"{k}:{headers[k]}\n" for k in sorted(headers)])
+    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
     canonical_request = "\n".join([method, canonical_uri, canonical_querystring, canonical_headers, signed_headers, payload_hash])
 
     algorithm = "AWS4-HMAC-SHA256"
@@ -111,7 +117,9 @@ def sp_api_request(method: str, path: str, *, params: dict | None = None, json_b
         raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": resp.text})
     return resp
 
-# ---- Routes
+# ──────────────────────────────────────────────────────────────────────────────
+# Routes
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/health")
 def health():
     return {"app": "Chatzon SP-API Bridge", "status": "ok", "time_utc": datetime.datetime.utcnow().isoformat()}
@@ -121,7 +129,9 @@ def diag_lwa():
     token = get_lwa_access_token()
     return {"status": 200, "access_token_prefix": token[:12] + "...", "expires_in": 3600}
 
-# ---- Feeds helpers
+# ──────────────────────────────────────────────────────────────────────────────
+# Feeds helpers
+# ──────────────────────────────────────────────────────────────────────────────
 def create_feed_document(access_token: str):
     body = {"contentType": "application/json; charset=UTF-8"}
     r = sp_api_request("POST", "/feeds/2021-06-30/documents", json_body=body, access_token=access_token)
@@ -143,7 +153,9 @@ def create_feed(access_token: str, marketplace_id: str, feed_document_id: str):
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
-# ---- Price update (fixed JSON_LISTINGS_FEED schema)
+# ──────────────────────────────────────────────────────────────────────────────
+# Price update (JSON_LISTINGS_FEED using attributes, not patches)
+# ──────────────────────────────────────────────────────────────────────────────
 @app.post("/update-price-fast")
 def update_price_fast(payload: dict = Body(...)):
     """
@@ -158,26 +170,26 @@ def update_price_fast(payload: dict = Body(...)):
     """
     token = get_lwa_access_token()
     sku = payload["sku"]
+    marketplace_id = payload.get("marketplaceId") or MARKETINGPLACE_ID if False else payload.get("marketplaceId")  # no-op safeguard
     marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
     amount = float(payload["amount"])
     currency = payload.get("currency", "USD")
     product_type = payload.get("productType", "PRODUCT")
 
+    # attributes-based UPDATE keeps schema simple; LISTING_OFFER_ONLY avoids full product attrs
     feed_body = {
         "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [{
             "messageId": 1,
             "sku": sku,
-            "operationType": "PARTIAL_UPDATE",
+            "operationType": "UPDATE",
             "productType": product_type,
-            "patches": [{
-                "op": "replace",
-                "path": "/attributes/standard_price",
-                "value": [{
-                    "marketplace_id": marketplace_id,
-                    "value": {"currency": currency, "amount": amount}
-                }]
-            }]
+            "requirements": "LISTING_OFFER_ONLY",
+            "attributes": {
+                "standard_price": [
+                    {"currency": currency, "amount": amount}
+                ]
+            }
         }]
     }
 
@@ -191,6 +203,9 @@ def update_price_fast(payload: dict = Body(...)):
         "note": "Use /feed-status?feedId=... until DONE, then /feed-report-by-doc?docId=..."
     }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Feed tracking
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/feeds/recent")
 def list_recent_feeds(maxResults: int = 3):
     token = get_lwa_access_token()
