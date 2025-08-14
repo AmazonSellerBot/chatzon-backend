@@ -140,7 +140,7 @@ def create_feed(access_token: str, marketplace_id: str, feed_document_id: str, f
     r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
     return r.json()
 
-# ── Price update via JSON_LISTINGS_FEED ───────────────────────────────────────
+# ── Price update via JSON_LISTINGS_FEED (optional) ────────────────────────────
 @app.post("/update-price-json")
 def update_price_json(payload: dict = Body(...)):
     """
@@ -160,7 +160,7 @@ def update_price_json(payload: dict = Body(...)):
     currency = payload.get("currency", "USD")
     product_type = payload.get("productType", "PRODUCT")
 
-    # JSON listings shape using purchasable_offer
+    # JSON Listings shape (purchasable_offer)
     feed_json = {
         "header": {"sellerId": SELLER_ID, "version": "2.0"},
         "messages": [{
@@ -187,9 +187,9 @@ def update_price_json(payload: dict = Body(...)):
     feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "JSON_LISTINGS_FEED")
     return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
 
-# ── Price update via legacy XML (POST_PRODUCT_PRICING_DATA) ───────────────────
+# ── Price update via legacy XML (recommended) ─────────────────────────────────
 def build_price_xml(sku: str, amount: float, currency: str) -> str:
-    # Minimal price feed per MWS/legacy schema
+    # Minimal, widely accepted price update for POST_PRODUCT_PRICING_DATA
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">
   <Header>
@@ -199,6 +199,7 @@ def build_price_xml(sku: str, amount: float, currency: str) -> str:
   <MessageType>Price</MessageType>
   <Message>
     <MessageID>1</MessageID>
+    <OperationType>Update</OperationType>
     <Price>
       <SKU>{sku}</SKU>
       <StandardPrice currency="{currency}">{amount:.2f}</StandardPrice>
@@ -224,16 +225,25 @@ def update_price_xml(payload: dict = Body(...)):
     currency = payload.get("currency", "USD")
 
     xml_body = build_price_xml(sku, amount, currency)
-    doc = create_feed_document(token, "text/xml; charset=UTF-8")
-    upload_feed_body(doc["url"], xml_body.encode("utf-8"), "text/xml; charset=UTF-8")
+    # Use application/xml (text/xml can be picky)
+    doc = create_feed_document(token, "application/xml; charset=UTF-8")
+    upload_feed_body(doc["url"], xml_body.encode("utf-8"), "application/xml; charset=UTF-8")
     feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "POST_PRODUCT_PRICING_DATA")
     return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
 
 # ── Feed tracking ─────────────────────────────────────────────────────────────
 @app.get("/feeds/recent")
-def list_recent_feeds(maxResults: int = 5):
+def list_recent_feeds(maxResults: int = 10, feedTypes: str = "POST_PRODUCT_PRICING_DATA,JSON_LISTINGS_FEED"):
+    """
+    Examples:
+      /feeds/recent?maxResults=10
+      /feeds/recent?maxResults=10&feedTypes=POST_PRODUCT_PRICING_DATA,JSON_LISTINGS_FEED
+    """
     token = get_lwa_access_token()
-    r = sp_api_request("GET", "/feeds/2021-06-30/feeds", params={"maxResults": maxResults}, access_token=token)
+    types = [t.strip() for t in (feedTypes or "").split(",") if t.strip()]
+    # SP-API expects repeated feedTypes entries (not a single comma string)
+    params = {"maxResults": maxResults, "feedTypes": types}
+    r = sp_api_request("GET", "/feeds/2021-06-30/feeds", params=params, access_token=token)
     return r.json()
 
 @app.get("/feed-status")
@@ -252,6 +262,7 @@ def feed_report_by_doc(docId: str):
         raise HTTPException(400, detail={"errors": [{"message": "Invalid document id or no URL returned"}]})
     dl = requests.get(url, timeout=60)
     content = dl.content
+    # Reports may be gzipped
     try:
         content = gzip.decompress(content)
     except OSError:
