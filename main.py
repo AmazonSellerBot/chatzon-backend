@@ -1,5 +1,12 @@
 # main.py
-# Chatzon Backend – Catalog check + Listings inspect + Robust price update
+# Chatzon Backend – Catalog+Listings+PriceUpdate (crash hotfix)
+# Routes:
+#   GET  /health
+#   GET  /catalog-by-sku
+#   GET  /inspect-listing
+#   POST /update-price
+#   POST /update-price-fast  (alias)
+
 import os, hmac, hashlib, json, time, datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode, quote
@@ -61,9 +68,11 @@ def _sign(method, host, region, uri, qs, hdrs, payload, ak, sk, st=None):
     creq="\n".join([method.upper(),uri,qs,chs,sh,ph])
     alg="AWS4-HMAC-SHA256"; scope=f"{d}/{region}/{svc}/aws4_request"
     s2s="\n".join([alg,amz,scope,hashlib.sha256(creq.encode()).hexdigest()])
-    def h(k,m): return hmac.new(k,m.encode(),hashlib.sha256).digest()
-    kdate=h(("AWS4"+sk).encode(),d); kreg=h(kdate,region)
-    ksvc=h(kreg,svc); ksig=h(ksvc,"aws4_request")
+    def hmacd(k,m): return hmac.new(k,m.encode(),hashlib.sha256).digest()
+    kdate=hmacd(("AWS4"+sk).encode(),d)
+    kreg=hmac.new(kdate,region.encode(),hashlib.sha256).digest()
+    ksvc=hmac.new(kreg,svc.encode(),hashlib.sha256).digest()
+    ksig=hmac.new(ksvc,b"aws4_request",hashlib.sha256).digest()
     sig=hmac.new(ksig,s2s.encode(),hashlib.sha256).hexdigest()
     out={"x-amz-date":amz,"Authorization":f"{alg} Credential={ak}/{scope}, SignedHeaders={sh}, Signature={sig}"}
     if st: out["x-amz-security-token"]=st
@@ -90,7 +99,7 @@ def _exec(method, path, query=None, body=None):
     raise ValueError("bad method")
 
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.8.0")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.8.1")
 
 @app.get("/health")
 def health(): return {"ok":True,"service":"chatzon-backend","time":datetime.datetime.utcnow().isoformat()+"Z"}
@@ -107,7 +116,7 @@ def catalog_by_sku(sku: str = Query(...), marketplaceId: str = Query(MARKETPLACE
                                  "x-amzn-RequestId": resp.headers.get("x-amzn-RequestId"),
                                  "result": body})
 
-# 2) Listings Items GET (if accepted, returns summaries incl. productType)
+# 2) Listings Items GET (may return summaries incl. productType)
 @app.get("/inspect-listing")
 def inspect_listing(sku: str = Query(...), marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT)):
     path=f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
@@ -132,7 +141,7 @@ def inspect_listing(sku: str = Query(...), marketplaceId: str = Query(MARKETPLAC
 # --- Price helpers (two attribute paths + two requirement modes) ---
 def _bodies_for_price(currency: str, amount: float, productType: str) -> List[Dict[str, Any]]:
     amt = round(float(amount), 2)
-    # A) purchasable_offer, value_with_tax as NUMBER
+    # A) purchasable_offer, value_with_tax NUMBER
     a = {
         "productType": productType,
         "patches": [{
@@ -181,10 +190,8 @@ def _try_patch_price(sku: str, marketplaceId: str, currency: str, amount: float,
             last["response"]=jr
             if 200 <= resp.status_code < 300:
                 return {"ok":True, "req":req, "variant":idx, "http":resp.status_code, "amazon": jr, "sent": {"query": q, "body": body}}
-            # If Amazon provides detailed issues, stop and show them
             if isinstance(jr, dict) and ("issues" in jr or "validationDetails" in jr):
                 return {"ok":False, "req":req, "variant":idx, "http":resp.status_code, "amazon": jr, "sent": {"query": q, "body": body}}
-            # otherwise loop to next
     return {"ok":False, "last": last}
 
 # 3) Price update endpoints (alias)
@@ -194,8 +201,7 @@ def update_price(body: Dict[str, Any] = Body(..., example={
     "sku":"ELECTRIC PICKLE JUICE-64 OZ-FBA","marketplaceId":"ATVPDKIKX0DER","currency":"USD","amount":20.99
 })):
     sku = body.get("sku")
-    marketplaceId = body.get("marketplaceId") or MARK
-ETPLACE_ID_DEFAULT
+    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT  # <-- fixed
     currency = str(body.get("currency","USD")).upper()
     amount = body.get("amount")
     if not (sku and marketplaceId and amount is not None):
