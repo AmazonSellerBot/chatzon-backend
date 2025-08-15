@@ -1,11 +1,11 @@
 # main.py
-# Chatzon Backend – Catalog + Listings + Price Update + Get Price
+# Chatzon Backend – Catalog + Listings + Price Update + Get Price (+ Auth Guard)
 # Routes:
 #   GET  /health
 #   GET  /catalog-by-sku
 #   GET  /inspect-listing
-#   GET  /get-offer-price           <- Product Pricing API (authoritative offer price)
-#   GET  /get-listing-price         <- Listings Items attributes (may be empty for price)
+#   GET  /get-offer-price
+#   GET  /get-listing-price
 #   POST /update-price
 #   POST /update-price-fast  (alias)
 #   POST /set-standard-price
@@ -15,7 +15,7 @@ import os, hmac, hashlib, json, time, datetime
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode, quote
 import requests
-from fastapi import FastAPI, Body, Query
+from fastapi import FastAPI, Body, Query, Request
 from fastapi.responses import JSONResponse
 
 # ===== Env =====
@@ -32,12 +32,14 @@ SP_API_ENDPOINT        = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi
 MARKETPLACE_ID_DEFAULT = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
 SELLER_ID              = os.getenv("SPAPI_SELLER_ID", "")
 
+# Token used by ChatGPT Action / API clients for mutating routes
+ACTION_TOKEN = os.getenv("ACTION_TOKEN", os.getenv("QUICK_TOKEN", ""))  # reuse QUICK_TOKEN if set
+
 # ===== Helpers =====
 _session = {"expires_at": 0, "creds": None}
 def _now() -> int: return int(time.time())
 
 def _assume_role():
-    """Assume role if ROLE_ARN is set; cache creds until expiry."""
     if not ROLE_ARN:
         return None
     if _session["creds"] and _session["expires_at"] - 30 > _now():
@@ -157,8 +159,22 @@ def _exec(method: str, path: str, query: Optional[Dict[str, Any]] = None, body: 
     if m == "DELETE": return requests.delete(url, headers=hdr, params=query, data=data, timeout=60)
     raise ValueError("bad method")
 
+# ----- Simple auth guard for POST (mutating) routes -----
+def _check_auth(request: Request):
+    """
+    Require Authorization: Bearer <ACTION_TOKEN> for POST routes if ACTION_TOKEN is set.
+    Leave GET routes open so you can probe/confirm easily.
+    """
+    if not ACTION_TOKEN:
+        return None  # unlocked (not recommended for production)
+    auth = request.headers.get("authorization", "")
+    expected = f"Bearer {ACTION_TOKEN}"
+    if auth != expected:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    return None
+
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.9.1")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.10.0")
 
 @app.get("/health")
 def health():
@@ -174,7 +190,7 @@ def catalog_by_sku(sku: str = Query(...), marketplaceId: str = Query(MARKETPLACE
             "identifiers": sku,
             "identifiersType": "SKU",
             "marketplaceIds": marketplaceId,
-            "sellerId": SELLER_ID,  # required
+            "sellerId": SELLER_ID,
             "includedData": "summaries,identifiers,attributes"
         },
     )
@@ -218,11 +234,6 @@ def get_offer_price(
     marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
     itemCondition: str = Query("New")  # New | Used | Collectible | Refurbished | Club
 ):
-    """
-    Reads price via Product Pricing API v0:
-    GET /products/pricing/v0/listings/{sellerSku}/offers
-    Requires scope: sellingpartnerapi::product-pricing:read
-    """
     path = f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers"
     resp = _exec("GET", path, query={
         "MarketplaceId": marketplaceId,
@@ -245,23 +256,18 @@ def get_offer_price(
     fulfillment = None
 
     if offers:
-        # Prefer your own offer when present
         mine = next((o for o in offers if o.get("MyOffer")), offers[0])
         my_offer = bool(mine.get("MyOffer"))
         is_buybox = mine.get("IsBuyBoxWinner")
         fulfillment = "AFN" if mine.get("IsFulfilledByAmazon") else "MFN"
-
-        # Many responses omit BuyingPrice; fall back to ListingPrice/LandedPrice
         bp = mine.get("BuyingPrice") or {}
         lp = bp.get("ListingPrice") or mine.get("ListingPrice") or {}
         land = bp.get("LandedPrice") or mine.get("LandedPrice") or {}
-
         if land.get("Amount") is not None:
             landed_price = float(land["Amount"]); currency = land.get("CurrencyCode")
         if lp.get("Amount") is not None:
             listing_price = float(lp["Amount"]); currency = currency or lp.get("CurrencyCode")
 
-    # Final fallback to Buy Box summary if needed
     if listing_price is None and isinstance(summary.get("BuyBoxPrices"), list) and summary["BuyBoxPrices"]:
         bb_lp = summary["BuyBoxPrices"][0].get("ListingPrice") or {}
         if bb_lp.get("Amount") is not None:
@@ -290,7 +296,6 @@ def get_listing_price(
     sku: str = Query(...),
     marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT)
 ):
-    """Reads listing attributes and extracts price if present (some listings omit price here)."""
     path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
     resp = _exec("GET", path, query={"marketplaceIds": marketplaceId})
     try:
@@ -320,7 +325,6 @@ def get_listing_price(
             return float(v["value"]), v.get("currency")
         return None, None
 
-    # purchasable_offer → our_price → schedule → value_with_tax / value
     try:
         po = attrs.get("purchasable_offer", [])
         if isinstance(po, list) and po:
@@ -341,7 +345,6 @@ def get_listing_price(
     except Exception:
         pass
 
-    # standard_price → value / value_with_tax
     if price is None:
         try:
             sp = attrs.get("standard_price", [])
@@ -374,28 +377,28 @@ def get_listing_price(
 # --- Price helpers (two attribute paths + two requirement modes) ---
 def _bodies_for_price(currency: str, amount: float, productType: str) -> List[Dict[str, Any]]:
     amt = round(float(amount), 2)
-    a = {  # purchasable_offer, value_with_tax NUMBER
+    a = {
         "productType": productType,
         "patches": [{
             "op": "replace", "path": "/attributes/purchasable_offer",
             "value": [{"currency": currency, "our_price": [{"schedule": [{"value_with_tax": amt}]}]}]
         }]
     }
-    b = {  # purchasable_offer, value_with_tax OBJECT
+    b = {
         "productType": productType,
         "patches": [{
             "op": "replace", "path": "/attributes/purchasable_offer",
             "value": [{"currency": currency, "our_price": [{"schedule": [{"value_with_tax": {"value": amt, "currency": currency}}]}]}]
         }]
     }
-    c = {  # standard_price value OBJECT
+    c = {
         "productType": productType,
         "patches": [{
             "op": "replace", "path": "/attributes/standard_price",
             "value": [{"value": {"value": amt, "currency": currency}}]
         }]
     }
-    d = {  # standard_price value_with_tax OBJECT
+    d = {
         "productType": productType,
         "patches": [{
             "op": "replace", "path": "/attributes/standard_price",
@@ -419,15 +422,18 @@ def _try_patch_price(sku: str, marketplaceId: str, currency: str, amount: float,
                 return {"ok": False, "req": req, "variant": idx, "http": resp.status_code, "amazon": jr, "sent": {"query": q, "body": body}}
     return {"ok": False, "http": 400, "amazon": {"errors": [{"code": "InvalidInput", "message": "Invalid parameters provided.", "details": ""}]}}
 
-# 5) Price update endpoints (alias)
+# 5) Price update endpoints (alias)  ---- AUTH GUARD APPLIED ----
 @app.post("/update-price")
 @app.post("/update-price-fast")
-def update_price(body: Dict[str, Any] = Body(..., example={
+def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
     "currency": "USD",
     "amount": 20.99
 })):
+    guard = _check_auth(request)
+    if guard: return guard
+
     sku = body.get("sku")
     marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
     currency = str(body.get("currency", "USD")).upper()
@@ -457,20 +463,22 @@ def update_price(body: Dict[str, Any] = Body(..., example={
     status = 200 if result.get("ok") else (result.get("http") or 400)
     return JSONResponse(status_code=status if status < 500 else 502, content={"result": result})
 
-# 6) Force standard_price (note: your productType rejects standard_price; use purchasable_offer)
+# 6) Force standard_price (note: many productTypes reject this; yours did)
 @app.post("/set-standard-price")
-def set_standard_price(body: Dict[str, Any] = Body(..., example={
+def set_standard_price(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
     "currency": "USD",
     "amount": 20.99
 })):
+    guard = _check_auth(request)
+    if guard: return guard
+
     sku = body.get("sku"); marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
     currency = str(body.get("currency","USD")).upper(); amount = float(body.get("amount", 0))
     if not (sku and marketplaceId and amount): return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
     if not SELLER_ID: return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
 
-    # find productType (fallback to PRODUCT)
     insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}", query={"marketplaceIds": marketplaceId})
     try: insp_json = insp.json()
     except Exception: insp_json = {"text": insp.text}
@@ -498,22 +506,24 @@ def set_standard_price(body: Dict[str, Any] = Body(..., example={
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
 
-# 7) Force purchasable_offer (this is the controller for DRINK_FLAVORED)
+# 7) Force purchasable_offer (controller for your DRINK_FLAVORED)
 @app.post("/set-purchasable-offer")
-def set_purchasable_offer(body: Dict[str, Any] = Body(..., example={
+def set_purchasable_offer(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
     "currency": "USD",
     "amount": 20.99,
     "requirements": "LISTING"  # or LISTING_OFFER_ONLY
 })):
+    guard = _check_auth(request)
+    if guard: return guard
+
     sku = body.get("sku"); marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
     currency = str(body.get("currency", "USD")).upper(); amount = float(body.get("amount"))
     requirements = body.get("requirements") or "LISTING_OFFER_ONLY"
     if not (sku and marketplaceId and amount): return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
     if not SELLER_ID: return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
 
-    # discover productType (fallback to PRODUCT)
     insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}", query={"marketplaceIds": marketplaceId})
     try: insp_json = insp.json()
     except Exception: insp_json = {"text": insp.text}
@@ -549,118 +559,3 @@ def set_purchasable_offer(body: Dict[str, Any] = Body(..., example={
     except Exception: jr = {"text": resp.text}
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
-# === NEW: Quick link endpoint (secure GET) to change price ===
-from fastapi.responses import HTMLResponse
-import re
-
-QUICK_TOKEN = os.getenv("QUICK_TOKEN", "")  # set this in Railway
-
-@app.get("/quick/price", response_class=HTMLResponse)
-def quick_price(
-    token: str = Query(..., description="Shared secret"),
-    sku: str = Query(...),
-    amount: str = Query(..., description="e.g. 19.99 or $19.99"),
-    marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
-    requirements: str = Query("LISTING"),
-    itemCondition: str = Query("New"),
-):
-    if not QUICK_TOKEN or token != QUICK_TOKEN:
-        return HTMLResponse('<h3>Forbidden</h3><p>Bad or missing token.</p>', status_code=403)
-
-    # Parse amount like "$19.99"
-    m = re.sub(r"[^\d.]", "", str(amount))
-    if not m:
-        return HTMLResponse('<h3>Bad Request</h3><p>Invalid amount.</p>', status_code=400)
-    try:
-        amt = round(float(m), 2)
-    except Exception:
-        return HTMLResponse('<h3>Bad Request</h3><p>Invalid amount.</p>', status_code=400)
-
-    # Discover productType (fallback to PRODUCT)
-    insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
-                 query={"marketplaceIds": marketplaceId})
-    try: insp_json = insp.json()
-    except Exception: insp_json = {"text": insp.text}
-    pt = None
-    try:
-        for s in (insp_json.get("summaries") or []):
-            if s.get("marketplaceId")==marketplaceId and s.get("productType"):
-                pt=s["productType"]; break
-        if not pt and (insp_json.get("summaries") or []):
-            pt=insp_json["summaries"][0].get("productType")
-    except Exception:
-        pt=None
-    if not pt: pt="PRODUCT"
-
-    # PATCH purchasable_offer (controller for your DRINK_FLAVORED)
-    patch_body = {
-        "productType": pt,
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{
-                "audience": "ALL",
-                "marketplace_id": marketplaceId,
-                "currency": "USD",
-                "our_price": [{"schedule": [{"value_with_tax": amt}]}]
-            }]
-        }]
-    }
-    path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
-    q = {"marketplaceIds": marketplaceId, "requirements": requirements, "issueLocale":"en_US"}
-    p = _exec("PATCH", path, query=q, body=patch_body)
-    try: preply = p.json()
-    except Exception: preply = {"text": p.text}
-
-    # Read back authoritative price (Product Pricing API)
-    pr = _exec("GET", f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers",
-               query={"MarketplaceId": marketplaceId, "ItemCondition": itemCondition})
-    try: prb = pr.json()
-    except Exception: prb = {"text": pr.text}
-
-    # Try to show your offer price in the HTML
-    new_price = None
-    try:
-        offers = (prb.get("payload") or {}).get("Offers") or []
-        mine = next((o for o in offers if o.get("MyOffer")), offers[0] if offers else None)
-        if mine:
-            lp = (mine.get("BuyingPrice") or {}).get("ListingPrice") or mine.get("ListingPrice") or {}
-            if lp.get("Amount") is not None:
-                new_price = float(lp["Amount"])
-        if new_price is None:
-            bb = ((prb.get("payload") or {}).get("Summary") or {}).get("BuyBoxPrices") or []
-            if bb:
-                lpb = bb[0].get("ListingPrice") or {}
-                if lpb.get("Amount") is not None:
-                    new_price = float(lpb["Amount"])
-    except Exception:
-        pass
-
-    ok = (200 <= p.status_code < 300)
-    html = f"""
-    <html><body style="font-family:system-ui;padding:20px">
-      <h2>Quick Price Update</h2>
-      <p><b>SKU:</b> {sku}</p>
-      <p><b>Marketplace:</b> {marketplaceId}</p>
-      <p><b>Target:</b> ${amt:.2f}</p>
-      <p><b>Patch:</b> {"ACCEPTED" if ok else "FAILED"} (HTTP {p.status_code})</p>
-      <pre style="background:#f6f6f6;padding:10px;border-radius:8px;white-space:pre-wrap">{json.dumps(preply, indent=2)[:2000]}</pre>
-      <h3>Authoritative Offer Price</h3>
-      <p><b>Detected:</b> {"$"+format(new_price, ".2f") if new_price is not None else "unknown"}</p>
-      <pre style="background:#f6f6f6;padding:10px;border-radius:8px;white-space:pre-wrap">{json.dumps(prb, indent=2)[:2000]}</pre>
-    </body></html>
-    """
-    return HTMLResponse(html, status_code=200 if ok else (p.status_code if p.status_code<500 else 502))
-# --- Add near the other envs ---
-ACTION_TOKEN = os.getenv("ACTION_TOKEN", os.getenv("QUICK_TOKEN", ""))
-
-from fastapi import Request
-
-def _check_auth(request: Request):
-    if not ACTION_TOKEN:
-        return None  # unlocked (not recommended)
-    auth = request.headers.get("authorization", "")
-    expected = f"Bearer {ACTION_TOKEN}"
-    if auth != expected:
-        return JSONResponse(status_code=403, content={"error": "forbidden"})
-    return None
