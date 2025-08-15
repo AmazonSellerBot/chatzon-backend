@@ -1,5 +1,5 @@
 # main.py
-# Chatzon Backend – Setup + Price Update (corrected schema)
+# Chatzon Backend – Setup + Price Update (pricing-only payload, per Amazon example)
 # Endpoints:
 #   GET  /health
 #   GET  /check-setup
@@ -49,7 +49,7 @@ def _assume_role_if_configured():
             "SecretAccessKey": creds["SecretAccessKey"],
             "SessionToken": creds["SessionToken"],
         }
-        _session_cache["expires_at"] = int(creds["Expiration"].timestamp())
+        _session_cache["expires_at"] = int(resp["Credentials"]["Expiration"].timestamp())
         return _session_cache["creds"]
     except Exception:
         return None
@@ -147,7 +147,7 @@ def execute_signed_request(method: str, path: str,
 # -----------------------------
 # FastAPI
 # -----------------------------
-app = FastAPI(title="Chatzon Backend – Setup + Price Update", version="2.3.0")
+app = FastAPI(title="Chatzon Backend – Setup + Price Update", version="2.4.0")
 
 @app.get("/health")
 def health():
@@ -165,7 +165,7 @@ def check_setup():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 # -----------------------------
-# POST /update-price  (fixed schema)
+# POST /update-price  (pricing-only, per Amazon example)
 # -----------------------------
 @app.post("/update-price")
 def update_price(payload: Dict[str, Any] = Body(..., example={
@@ -184,8 +184,7 @@ def update_price(payload: Dict[str, Any] = Body(..., example={
     if not SELLER_ID:
         return JSONResponse(status_code=500, content={"error": "SPAPI_SELLER_ID is not set in environment"})
 
-    # Correct Listings Items PATCH body per Amazon docs:
-    # Each offer requires audience, currency, marketplace_id; price is numeric at value_with_tax.
+    # Exactly as in Amazon docs for pricing-only patches:
     body = {
         "productType": "PRODUCT",
         "patches": [
@@ -194,9 +193,7 @@ def update_price(payload: Dict[str, Any] = Body(..., example={
                 "path": "/attributes/purchasable_offer",
                 "value": [
                     {
-                        "audience": "ALL",
                         "currency": currency,
-                        "marketplace_id": marketplace_id,
                         "our_price": [
                             {
                                 "schedule": [
@@ -215,13 +212,11 @@ def update_price(payload: Dict[str, Any] = Body(..., example={
         resp = execute_signed_request(
             method="PATCH",
             path=path,
-            query={"marketplaceIds": [marketplace_id]},
+            query={"marketplaceIds": [marketplace_id], "issueLocale": "en_US"},
             body_json=body,
         )
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"text": resp.text[:2000]}
+        try: data = resp.json()
+        except Exception: data = {"text": resp.text[:2000]}
         return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=data)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
