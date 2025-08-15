@@ -451,4 +451,44 @@ def get_offer_price(
     if resp.status_code >= 300 or (listing_price is None and landed_price is None):
         out["raw"] = body
     return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
+# === NEW: Force standard_price to a value ===
+@app.post("/set-standard-price")
+def set_standard_price(body: Dict[str, Any] = Body(..., example={
+    "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
+    "marketplaceId": "ATVPDKIKX0DER",
+    "currency": "USD",
+    "amount": 20.99
+})):
+    sku = body.get("sku"); marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
+    currency = str(body.get("currency","USD")).upper(); amount = float(body.get("amount", 0))
+    if not (sku and marketplaceId and amount): return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
+    if not SELLER_ID: return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
+
+    # find productType (fallback to PRODUCT)
+    insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}", query={"marketplaceIds": marketplaceId})
+    try: insp_json = insp.json()
+    except Exception: insp_json = {"text": insp.text}
+    pt = None
+    try:
+        for s in (insp_json.get("summaries") or []):
+            if s.get("marketplaceId")==marketplaceId and s.get("productType"): pt=s["productType"]; break
+        if not pt and (insp_json.get("summaries") or []): pt=insp_json["summaries"][0].get("productType")
+    except Exception: pt=None
+    if not pt: pt="PRODUCT"
+
+    patch_body = {
+        "productType": pt,
+        "patches": [{
+            "op":"replace",
+            "path":"/attributes/standard_price",
+            "value":[{"value": {"value": round(amount,2), "currency": currency}}]
+        }]
+    }
+    path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
+    q = {"marketplaceIds": marketplaceId, "requirements": "LISTING", "issueLocale":"en_US"}
+    resp = _exec("PATCH", path, query=q, body=patch_body)
+    try: jr = resp.json()
+    except Exception: jr = {"text": resp.text}
+    return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
+                        content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
 
