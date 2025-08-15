@@ -1,21 +1,12 @@
 # main.py
-# Chatzon Backend – Setup + Robust Price Update (with full Amazon error surfacing)
-# Routes:
-#   GET  /health
-#   GET  /check-setup
-#   POST /update-price
-#   POST /update-price-fast  (alias)
-
+# Chatzon Backend – Inspect + Price Update (uses productType + LISTING_OFFER_ONLY)
 import os, hmac, hashlib, json, time, datetime
-from typing import Optional, Dict, Any, List
-from urllib.parse import urlencode
+from typing import Optional, Dict, Any
+from urllib.parse import urlencode, quote
 import requests
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Query
 from fastapi.responses import JSONResponse
 
-# -----------------------------
-# Env
-# -----------------------------
 LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID", "")
 LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET", "")
 LWA_REFRESH_TOKEN = os.getenv("LWA_REFRESH_TOKEN", "")
@@ -28,262 +19,157 @@ ROLE_ARN       = os.getenv("SPAPI_ROLE_ARN", "")
 SP_API_ENDPOINT        = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
 MARKETPLACE_ID_DEFAULT = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
 SELLER_ID              = os.getenv("SPAPI_SELLER_ID", "")
-APPLICATION_ID         = os.getenv("SPAPI_APPLICATION_ID", "")
 
-# -----------------------------
-# Helpers
-# -----------------------------
-_session_cache: Dict[str, Any] = {"expires_at": 0, "creds": None}
-def _now_epoch() -> int: return int(time.time())
+_session = {"expires_at": 0, "creds": None}
+def _now(): return int(time.time())
 
-def _assume_role_if_configured():
-    global _session_cache
+def _assume_role():
     if not ROLE_ARN: return None
-    if _session_cache["creds"] and _session_cache["expires_at"] - 30 > _now_epoch():
-        return _session_cache["creds"]
+    if _session["creds"] and _session["expires_at"] - 30 > _now(): return _session["creds"]
     try:
         import boto3  # type: ignore
-        sts = boto3.client("sts",
-            region_name=AWS_REGION,
-            aws_access_key_id=AWS_ACCESS_KEY,
-            aws_secret_access_key=AWS_SECRET_KEY,
-        )
-        resp = sts.assume_role(RoleArn=ROLE_ARN, RoleSessionName="chatzon-spapi-session")
-        creds = resp["Credentials"]
-        _session_cache["creds"] = {
-            "AccessKeyId": creds["AccessKeyId"],
-            "SecretAccessKey": creds["SecretAccessKey"],
-            "SessionToken": creds["SessionToken"],
-        }
-        _session_cache["expires_at"] = int(creds["Expiration"].timestamp())
-        return _session_cache["creds"]
+        sts = boto3.client("sts", region_name=AWS_REGION,
+                           aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
+        r = sts.assume_role(RoleArn=ROLE_ARN, RoleSessionName="chatzon-spapi-session")
+        c = r["Credentials"]
+        _session["creds"] = {"AccessKeyId": c["AccessKeyId"], "SecretAccessKey": c["SecretAccessKey"], "SessionToken": c["SessionToken"]}
+        _session["expires_at"] = int(c["Expiration"].timestamp())
+        return _session["creds"]
     except Exception:
         return None
 
-def get_lwa_access_token() -> str:
+def _get_lwa():
     r = requests.post("https://api.amazon.com/auth/o2/token", data={
-        "grant_type": "refresh_token",
-        "refresh_token": LWA_REFRESH_TOKEN,
-        "client_id": LWA_CLIENT_ID,
-        "client_secret": LWA_CLIENT_SECRET,
+        "grant_type":"refresh_token","refresh_token":LWA_REFRESH_TOKEN,
+        "client_id":LWA_CLIENT_ID,"client_secret":LWA_CLIENT_SECRET
     }, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"LWA token error {r.status_code}: {r.text}")
+    if r.status_code!=200: raise RuntimeError(f"LWA token error {r.status_code}: {r.text}")
     return r.json()["access_token"]
 
-# ---------- SigV4 ----------
-def _sign(method: str, host: str, region: str, canonical_uri: str,
-          canonical_querystring: str, headers: Dict[str, str],
-          payload: bytes, aws_access_key: str, aws_secret_key: str,
-          aws_session_token: Optional[str] = None) -> Dict[str, str]:
-    service = "execute-api"
-    t = datetime.datetime.utcnow()
-    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = t.strftime("%Y%m%d")
-
-    canonical_headers_items = {"host": host, "x-amz-date": amz_date}
-    # Include same headers we’ll send so signature matches exactly
-    for k, v in headers.items():
-        canonical_headers_items[k.lower()] = v
-    signed_headers_list = sorted(canonical_headers_items.keys())
-    canonical_headers = "".join([f"{k}:{canonical_headers_items[k]}\n" for k in signed_headers_list])
-    signed_headers = ";".join(signed_headers_list)
-    payload_hash = hashlib.sha256(payload).hexdigest()
-
-    canonical_request = "\n".join([
-        method.upper(), canonical_uri, canonical_querystring,
-        canonical_headers, signed_headers, payload_hash
-    ])
-
-    algorithm = "AWS4-HMAC-SHA256"
-    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
-    string_to_sign = "\n".join([
-        algorithm, amz_date, credential_scope,
-        hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()
-    ])
-
-    def _hmac(key, msg): return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-    k_date = _hmac(("AWS4" + aws_secret_key).encode("utf-8"), date_stamp)
-    k_region = hmac.new(k_date, region.encode("utf-8"), hashlib.sha256).digest()
-    k_service = hmac.new(k_region, b"execute-api", hashlib.sha256).digest()
-    k_signing = hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
-    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    out = {"x-amz-date": amz_date,
-           "Authorization": f"{algorithm} Credential={aws_access_key}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}"}
-    if aws_session_token: out["x-amz-security-token"] = aws_session_token
+def _sign(method, host, region, uri, qs, hdrs, payload, ak, sk, st=None):
+    svc="execute-api"; t=datetime.datetime.utcnow()
+    amz=t.strftime("%Y%m%dT%H%M%SZ"); d=t.strftime("%Y%m%d")
+    ch={"host":host,"x-amz-date":amz}
+    for k,v in hdrs.items(): ch[k.lower()]=v
+    sh=";".join(sorted(ch.keys()))
+    chs="".join([f"{k}:{ch[k]}\n" for k in sorted(ch.keys())])
+    ph=hashlib.sha256(payload).hexdigest()
+    creq="\n".join([method.upper(),uri,qs,chs,sh,ph])
+    alg="AWS4-HMAC-SHA256"; scope=f"{d}/{region}/{svc}/aws4_request"
+    s2s="\n".join([alg,amz,scope,hashlib.sha256(creq.encode()).hexdigest()])
+    def hmacd(k,m): return hmac.new(k,m.encode(),hashlib.sha256).digest()
+    kdate=hmacd(("AWS4"+sk).encode(),d); kreg=hmac.new(kdate,region.encode(),hashlib.sha256).digest()
+    ksvc=hmac.new(kreg,svc.encode(),hashlib.sha256).digest()
+    ksig=hmac.new(ksvc,b"aws4_request",hashlib.sha256).digest()
+    sig=hmac.new(ksig,s2s.encode(),hashlib.sha256).hexdigest()
+    out={"x-amz-date":amz,"Authorization":f"{alg} Credential={ak}/{scope}, SignedHeaders={sh}, Signature={sig}"}
+    if st: out["x-amz-security-token"]=st
     return out
 
-def execute_signed_request(method: str, path: str,
-                           query: Optional[Dict[str, Any]] = None,
-                           body_json: Optional[Dict[str, Any]] = None) -> requests.Response:
-    base_url = SP_API_ENDPOINT.rstrip("/")
-    url = f"{base_url}{path}"
-    host = base_url.replace("https://", "").replace("http://", "")
-    canonical_querystring = urlencode(query or {}, doseq=True)
+def _exec(method, path, query=None, body=None):
+    base=SP_API_ENDPOINT.rstrip("/"); url=f"{base}{path}"; host=base.replace("https://","").replace("http://","")
+    qs=urlencode(query or {}, doseq=True)
+    headers={"accept":"application/json","content-type":"application/json","x-amz-access-token":_get_lwa()}
+    data=None; payload=b""
+    if body is not None:
+        data=json.dumps(body, separators=(",", ":"), ensure_ascii=False); payload=data.encode()
+    creds=_assume_role()
+    if creds: ak,sk,st=creds["AccessKeyId"],creds["SecretAccessKey"],creds.get("SessionToken")
+    else: ak,sk,st=AWS_ACCESS_KEY,AWS_SECRET_KEY,None
+    signed=_sign(method,host,AWS_REGION,path,qs,{"x-amz-access-token":headers["x-amz-access-token"],"content-type":"application/json"},payload,ak,sk,st)
+    hdr={**headers,**signed}
+    m=method.upper()
+    if m=="GET":    return requests.get(url,headers=hdr,params=query,timeout=60)
+    if m=="PATCH":  return requests.patch(url,headers=hdr,params=query,data=data,timeout=60)
+    if m=="POST":   return requests.post(url,headers=hdr,params=query,data=data,timeout=60)
+    if m=="PUT":    return requests.put(url,headers=hdr,params=query,data=data,timeout=60)
+    if m=="DELETE": return requests.delete(url,headers=hdr,params=query,data=data,timeout=60)
+    raise ValueError("bad method")
 
-    headers = {
-        "content-type": "application/json",
-        "accept": "application/json",
-        "x-amz-access-token": get_lwa_access_token(),
-    }
-
-    data_str = None
-    payload_bytes = b""
-    if body_json is not None:
-        data_str = json.dumps(body_json, separators=(",", ":"), ensure_ascii=False)
-        payload_bytes = data_str.encode("utf-8")
-
-    # Prefer assumed role session
-    creds = _assume_role_if_configured()
-    if creds:
-        ak, sk, st = creds["AccessKeyId"], creds["SecretAccessKey"], creds.get("SessionToken")
-    else:
-        ak, sk, st = AWS_ACCESS_KEY, AWS_SECRET_KEY, None
-
-    signed = _sign(method, host, AWS_REGION, path, canonical_querystring,
-                   {"x-amz-access-token": headers["x-amz-access-token"], "content-type": headers["content-type"]},
-                   payload_bytes, ak, sk, st)
-    final_headers = {**headers, **signed}
-
-    m = method.upper()
-    if m == "GET":    return requests.get(url, headers=final_headers, params=query, timeout=60)
-    if m == "POST":   return requests.post(url, headers=final_headers, params=query, data=data_str, timeout=60)
-    if m == "PUT":    return requests.put(url, headers=final_headers, params=query, data=data_str, timeout=60)
-    if m == "PATCH":  return requests.patch(url, headers=final_headers, params=query, data=data_str, timeout=60)
-    if m == "DELETE": return requests.delete(url, headers=final_headers, params=query, data=data_str, timeout=60)
-    raise ValueError(f"Unsupported method: {method}")
-
-# -----------------------------
-# FastAPI
-# -----------------------------
-app = FastAPI(title="Chatzon Backend – Setup + Robust Price Update", version="2.6.0")
+app = FastAPI(title="Chatzon Backend – Inspect + Price Update", version="2.7.0")
 
 @app.get("/health")
-def health():
-    return {"ok": True, "service": "chatzon-backend", "time": datetime.datetime.utcnow().isoformat() + "Z"}
+def health(): return {"ok":True,"service":"chatzon-backend","time":datetime.datetime.utcnow().isoformat()+"Z"}
 
-@app.get("/check-setup")
-def check_setup():
+@app.get("/inspect-listing")
+def inspect_listing(sku: str = Query(...), marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT)):
+    path=f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
+    resp=_exec("GET", path, query={"marketplaceIds": marketplaceId})
+    body_text=resp.text
+    try: body_json=resp.json()
+    except Exception: body_json={"text":body_text}
+    # Extract productType from summaries if present
+    pt = None
     try:
-        resp = execute_signed_request("GET", "/sellers/v1/marketplaceParticipations")
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"text": resp.text}
-        return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502,
-                            content={"status_code": resp.status_code, "data": data})
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
-# -----------------------------
-# Price update (tries multiple variants; returns full Amazon text)
-# -----------------------------
-def _build_variants(currency: str, amount: float, marketplace_id: str) -> List[Dict[str, Any]]:
-    amt = round(float(amount), 2)
-
-    # A) pricing-only, value_with_tax NUMBER
-    a = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{"currency": currency, "our_price": [{"schedule": [{"value_with_tax": amt}]}]}]
-        }]
-    }
-    # B) pricing-only, value_with_tax OBJECT {value,currency}
-    b = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{"currency": currency, "our_price": [{"schedule": [{"value_with_tax": {"value": amt, "currency": currency}}]}]}]
-        }]
-    }
-    # C) include audience/marketplace_id, value_with_tax NUMBER
-    c = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{"audience": "ALL", "currency": currency, "marketplace_id": marketplace_id,
-                       "our_price": [{"schedule": [{"value_with_tax": amt}]}]}]
-        }]
-    }
-    # D) use "value" OBJECT instead of "value_with_tax"
-    d = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{"currency": currency, "our_price": [{"schedule": [{"value": {"value": amt, "currency": currency}}]}]}]
-        }]
-    }
-    # E) same as A but op "add"
-    e = {
-        "productType": "PRODUCT",
-        "patches": [{
-            "op": "add",
-            "path": "/attributes/purchasable_offer",
-            "value": [{"currency": currency, "our_price": [{"schedule": [{"value_with_tax": amt}]}]}]
-        }]
-    }
-    return [a, b, c, d, e]
-
-def _call_patch(sku: str, marketplace_id: str, body: Dict[str, Any]) -> requests.Response:
-    path = f"/listings/2021-08-01/items/{SELLER_ID}/{requests.utils.quote(sku, safe='')}"
-    return execute_signed_request(
-        method="PATCH",
-        path=path,
-        query={"marketplaceIds": [marketplace_id], "issueLocale": "en_US"},
-        body_json=body,
-    )
-
-def _do_update_price(sku: str, marketplace_id: str, currency: str, amount: float):
-    if not SELLER_ID:
-        return JSONResponse(status_code=500, content={"error": "SPAPI_SELLER_ID is not set in environment"})
-
-    variants = _build_variants(currency, amount, marketplace_id)
-    last = None
-    for idx, body in enumerate(variants, start=1):
-        resp = _call_patch(sku, marketplace_id, body)
-        last = resp
-        try:
-            data = resp.json()
-        except Exception:
-            data = {"text": resp.text}
-        # succeed immediately on 2xx
-        if 200 <= resp.status_code < 300:
-            return JSONResponse(status_code=resp.status_code, content={"variant": idx, "response": data})
-        # if Amazon returns detailed issues, surface and stop so we can read it
-        if isinstance(data, dict) and ("issues" in data or "validationDetails" in data):
-            return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502,
-                                content={"variant": idx, "response": data})
-        # keep iterating on 400 InvalidInput with no details
-        if resp.status_code != 400:
-            return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502,
-                                content={"variant": idx, "response": data})
-
-    # show last failure in full (no truncation)
-    try:
-        data = last.json()
+        sums = body_json.get("summaries") or []
+        for s in sums:
+            if s.get("marketplaceId")==marketplaceId and s.get("productType"):
+                pt = s["productType"]; break
+        if not pt and sums and sums[0].get("productType"): pt = sums[0]["productType"]
     except Exception:
-        data = {"text": last.text if last is not None else "No response"}
-    return JSONResponse(status_code=last.status_code if last and last.status_code < 500 else 502,
-                        content={"variant": "all_failed", "response": data})
+        pt = None
+    return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
+                        content={"status_code":resp.status_code,
+                                 "x-amzn-RequestId": resp.headers.get("x-amzn-RequestId"),
+                                 "productType": pt,
+                                 "raw": body_json})
+
+def _patch_price(sku: str, marketplaceId: str, currency: str, amount: float, productType: str):
+    path=f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
+    body={
+        "productType": productType,
+        "patches":[
+            {
+                "op":"replace",
+                "path":"/attributes/purchasable_offer",
+                "value":[
+                    {
+                        "our_price":[{"schedule":[{"value_with_tax":{"value":round(float(amount),2),"currency":currency}}]}]
+                    }
+                ]
+            }
+        ]
+    }
+    # IMPORTANT: marketplaceIds as STRING + requirements=LISTING_OFFER_ONLY
+    return _exec("PATCH", path, query={"marketplaceIds": marketplaceId,
+                                       "requirements": "LISTING_OFFER_ONLY",
+                                       "issueLocale":"en_US"}, body=body)
 
 @app.post("/update-price")
 @app.post("/update-price-fast")
-def update_price(payload: Dict[str, Any] = Body(..., example={
-    "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
-    "marketplaceId": "ATVPDKIKX0DER",
-    "currency": "USD",
-    "amount": 20.99
+def update_price(body: Dict[str, Any] = Body(..., example={
+    "sku":"ELECTRIC PICKLE JUICE-64 OZ-FBA","marketplaceId":"ATVPDKIKX0DER","currency":"USD","amount":20.99
 })):
-    sku = payload.get("sku")
-    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
-    currency = str(payload.get("currency", "USD")).upper()
-    amount = payload.get("amount")
-    if not sku or not marketplace_id or amount is None:
-        return JSONResponse(status_code=400, content={"error": "sku, marketplaceId, currency, amount are required"})
-    return _do_update_price(sku, marketplace_id, currency, float(amount))
+    sku = body.get("sku")
+    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
+    currency = str(body.get("currency","USD")).upper()
+    amount = body.get("amount")
+    if not (sku and marketplaceId and amount is not None):
+        return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, currency, amount are required"})
+    if not SELLER_ID:
+        return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
+
+    # 1) Discover productType
+    insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
+                 query={"marketplaceIds": marketplaceId})
+    try: insp_json = insp.json()
+    except Exception: insp_json = {"text": insp.text}
+    pt=None
+    try:
+        for s in (insp_json.get("summaries") or []):
+            if s.get("marketplaceId")==marketplaceId and s.get("productType"):
+                pt=s["productType"]; break
+        if not pt and (insp_json.get("summaries") or []):
+            pt=(insp_json["summaries"][0].get("productType")) or pt
+    except Exception: pt=None
+    if not pt: pt="PRODUCT"  # fallback
+
+    # 2) Patch price, offer-only requirements
+    resp=_patch_price(sku, marketplaceId, currency, float(amount), pt)
+    try: out=resp.json()
+    except Exception: out={"text":resp.text}
+    return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
+                        content={"status_code":resp.status_code,
+                                 "x-amzn-RequestId": resp.headers.get("x-amzn-RequestId"),
+                                 "productTypeUsed": pt,
+                                 "response": out})
