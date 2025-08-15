@@ -4,9 +4,12 @@
 #   GET  /health
 #   GET  /catalog-by-sku
 #   GET  /inspect-listing
-#   GET  /get-listing-price
+#   GET  /get-offer-price           <- Product Pricing API (authoritative offer price)
+#   GET  /get-listing-price         <- Listings Items attributes (may be empty for price)
 #   POST /update-price
 #   POST /update-price-fast  (alias)
+#   POST /set-standard-price
+#   POST /set-purchasable-offer
 
 import os, hmac, hashlib, json, time, datetime
 from typing import Optional, Dict, Any, List
@@ -155,7 +158,7 @@ def _exec(method: str, path: str, query: Optional[Dict[str, Any]] = None, body: 
     raise ValueError("bad method")
 
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.9.0")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.9.1")
 
 @app.get("/health")
 def health():
@@ -208,13 +211,86 @@ def inspect_listing(sku: str = Query(...), marketplaceId: str = Query(MARKETPLAC
                  "raw": body}
     )
 
-# 3) Get current offer price for a SKU (Listings Items GET)
+# 3) Product Pricing API – authoritative offer price by SKU
+@app.get("/get-offer-price")
+def get_offer_price(
+    sku: str = Query(...),
+    marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
+    itemCondition: str = Query("New")  # New | Used | Collectible | Refurbished | Club
+):
+    """
+    Reads price via Product Pricing API v0:
+    GET /products/pricing/v0/listings/{sellerSku}/offers
+    Requires scope: sellingpartnerapi::product-pricing:read
+    """
+    path = f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers"
+    resp = _exec("GET", path, query={
+        "MarketplaceId": marketplaceId,
+        "ItemCondition": itemCondition
+    })
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"text": resp.text}
+
+    payload = body.get("payload", body)
+    offers = payload.get("Offers") or []
+    summary = payload.get("Summary") or {}
+
+    listing_price = None
+    landed_price = None
+    currency = None
+    my_offer = None
+    is_buybox = None
+    fulfillment = None
+
+    if offers:
+        # Prefer your own offer when present
+        mine = next((o for o in offers if o.get("MyOffer")), offers[0])
+        my_offer = bool(mine.get("MyOffer"))
+        is_buybox = mine.get("IsBuyBoxWinner")
+        fulfillment = "AFN" if mine.get("IsFulfilledByAmazon") else "MFN"
+
+        # Many responses omit BuyingPrice; fall back to ListingPrice/LandedPrice
+        bp = mine.get("BuyingPrice") or {}
+        lp = bp.get("ListingPrice") or mine.get("ListingPrice") or {}
+        land = bp.get("LandedPrice") or mine.get("LandedPrice") or {}
+
+        if land.get("Amount") is not None:
+            landed_price = float(land["Amount"]); currency = land.get("CurrencyCode")
+        if lp.get("Amount") is not None:
+            listing_price = float(lp["Amount"]); currency = currency or lp.get("CurrencyCode")
+
+    # Final fallback to Buy Box summary if needed
+    if listing_price is None and isinstance(summary.get("BuyBoxPrices"), list) and summary["BuyBoxPrices"]:
+        bb_lp = summary["BuyBoxPrices"][0].get("ListingPrice") or {}
+        if bb_lp.get("Amount") is not None:
+            listing_price = float(bb_lp["Amount"]); currency = currency or bb_lp.get("CurrencyCode")
+
+    out = {
+        "status_code": resp.status_code,
+        "sku": sku,
+        "marketplaceId": marketplaceId,
+        "itemCondition": itemCondition,
+        "listing_price": listing_price,
+        "landed_price": landed_price,
+        "currency": currency,
+        "is_buybox_winner": is_buybox,
+        "my_offer": my_offer,
+        "fulfillment": fulfillment,
+        "summary": summary,
+    }
+    if resp.status_code >= 300 or (listing_price is None and landed_price is None):
+        out["raw"] = body
+    return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
+
+# 4) Get current price from Listings Items attributes (may be empty for price)
 @app.get("/get-listing-price")
 def get_listing_price(
     sku: str = Query(...),
     marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT)
 ):
-    """Reads listing and extracts the current price (purchasable_offer / standard_price)."""
+    """Reads listing attributes and extracts price if present (some listings omit price here)."""
     path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
     resp = _exec("GET", path, query={"marketplaceIds": marketplaceId})
     try:
@@ -343,7 +419,7 @@ def _try_patch_price(sku: str, marketplaceId: str, currency: str, amount: float,
                 return {"ok": False, "req": req, "variant": idx, "http": resp.status_code, "amazon": jr, "sent": {"query": q, "body": body}}
     return {"ok": False, "http": 400, "amazon": {"errors": [{"code": "InvalidInput", "message": "Invalid parameters provided.", "details": ""}]}}
 
-# 4) Price update endpoints (alias)
+# 5) Price update endpoints (alias)
 @app.post("/update-price")
 @app.post("/update-price-fast")
 def update_price(body: Dict[str, Any] = Body(..., example={
@@ -380,78 +456,8 @@ def update_price(body: Dict[str, Any] = Body(..., example={
     result = _try_patch_price(sku, marketplaceId, currency, float(amount), pt)
     status = 200 if result.get("ok") else (result.get("http") or 400)
     return JSONResponse(status_code=status if status < 500 else 502, content={"result": result})
-    # === NEW: Product Pricing API – get your current offer price by SKU ===
-@app.get("/get-offer-price")
-def get_offer_price(
-    sku: str = Query(...),
-    marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
-    itemCondition: str = Query("New")  # New | Used | Collectible | Refurbished | Club
-):
-    """
-    Reads price via Product Pricing API v0:
-    GET /products/pricing/v0/listings/{sellerSku}/offers
-    Requires scope: sellingpartnerapi::product-pricing:read
-    """
-    path = f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers"
-    resp = _exec("GET", path, query={
-        "MarketplaceId": marketplaceId,
-        "ItemCondition": itemCondition
-    })
 
-    try:
-        body = resp.json()
-    except Exception:
-        body = {"text": resp.text}
-
-    # unwrap payload if present
-    payload = body.get("payload", body)
-    offers = payload.get("Offers") or []
-    summary = payload.get("Summary") or {}
-
-    listing_price = None
-    landed_price = None
-    currency = None
-    fulfillment = None
-    is_buybox = None
-
-    if offers:
-        o0 = offers[0]
-        # Prefer BuyingPrice (has LandedPrice + ListingPrice)
-        bp = o0.get("BuyingPrice") or {}
-        lp = bp.get("ListingPrice") or {}
-        land = bp.get("LandedPrice") or {}
-        reg = o0.get("RegularPrice") or {}
-
-        # Pick best-known fields
-        if land.get("Amount") is not None:
-            landed_price = float(land["Amount"])
-            currency = land.get("CurrencyCode")
-        if lp.get("Amount") is not None:
-            listing_price = float(lp["Amount"])
-            currency = currency or lp.get("CurrencyCode")
-        if listing_price is None and reg.get("Amount") is not None:
-            listing_price = float(reg["Amount"])
-            currency = currency or reg.get("CurrencyCode")
-
-        fulfillment = o0.get("FulfillmentType")  # AFN/MFN
-        is_buybox = o0.get("IsBuyBoxWinner")
-
-    out = {
-        "status_code": resp.status_code,
-        "sku": sku,
-        "marketplaceId": marketplaceId,
-        "itemCondition": itemCondition,
-        "listing_price": listing_price,
-        "landed_price": landed_price,
-        "currency": currency,
-        "is_buybox_winner": is_buybox,
-        "fulfillment": fulfillment,
-        "summary": summary,
-    }
-    if resp.status_code >= 300 or (listing_price is None and landed_price is None):
-        out["raw"] = body
-    return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
-# === NEW: Force standard_price to a value ===
+# 6) Force standard_price (note: your productType rejects standard_price; use purchasable_offer)
 @app.post("/set-standard-price")
 def set_standard_price(body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
@@ -491,7 +497,8 @@ def set_standard_price(body: Dict[str, Any] = Body(..., example={
     except Exception: jr = {"text": resp.text}
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
-# === NEW: Force purchasable_offer explicitly ===
+
+# 7) Force purchasable_offer (this is the controller for DRINK_FLAVORED)
 @app.post("/set-purchasable-offer")
 def set_purchasable_offer(body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
@@ -542,4 +549,3 @@ def set_purchasable_offer(body: Dict[str, Any] = Body(..., example={
     except Exception: jr = {"text": resp.text}
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
-
