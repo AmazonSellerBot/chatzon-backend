@@ -1,273 +1,292 @@
 # main.py
-import os, json, gzip, hmac, hashlib, datetime
-from urllib.parse import urlparse, urlencode
+# FastAPI app to sanity-check SP-API credentials and signing.
+# Endpoints:
+#   GET /health
+#   GET /check-setup  -> calls /sellers/v1/marketplaceParticipations
+
+import os
+import hmac
+import hashlib
+import json
+import time
+import datetime
+from typing import Optional, Dict, Any
+from urllib.parse import urlencode
+
 import requests
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(title="Chatzon SP-API Bridge")
+# -----------------------------
+# Environment variables (required)
+# -----------------------------
+LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID", "")
+LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET", "")
+LWA_REFRESH_TOKEN = os.getenv("LWA_REFRESH_TOKEN", "")
 
-# ── Env ───────────────────────────────────────────────────────────────────────
-REGION            = os.getenv("REGION", "us-east-1")
-SP_API_ENDPOINT   = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
-MARKETPLACE_ID    = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")
-SELLER_ID         = os.getenv("SELLER_ID") or os.getenv("SPAPI_SELLER_ID")
+AWS_ACCESS_KEY = os.getenv("SPAPI_AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_KEY = os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION = os.getenv("REGION", "us-east-1")
+ROLE_ARN = os.getenv("SPAPI_ROLE_ARN", "")  # optional, recommended
 
-# Support either AWS_* or SPAPI_AWS_* names
-AWS_KEY           = os.getenv("AWS_ACCESS_KEY_ID")        or os.getenv("SPAPI_AWS_ACCESS_KEY_ID")
-AWS_SECRET        = os.getenv("AWS_SECRET_ACCESS_KEY")    or os.getenv("SPAPI_AWS_SECRET_ACCESS_KEY")
-AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN")        or os.getenv("SPAPI_AWS_SESSION_TOKEN")   # optional
+SP_API_ENDPOINT = os.getenv("SP_API_ENDPOINT", "https://sellingpartnerapi-na.amazon.com")
+MARKETPLACE_ID = os.getenv("SPAPI_MARKETPLACE_ID", "ATVPDKIKX0DER")  # US default
+SELLER_ID = os.getenv("SPAPI_SELLER_ID", "")  # optional (not needed for this check)
+APPLICATION_ID = os.getenv("SPAPI_APPLICATION_ID", "")  # optional (Solution ID)
 
-LWA_CLIENT_ID     = os.getenv("LWA_CLIENT_ID")
-LWA_CLIENT_SECRET = os.getenv("LWA_CLIENT_SECRET")
-LWA_REFRESH_TOKEN = os.getenv("LWA_REFRESH_TOKEN")
+# -----------------------------
+# Optional: assume role with boto3 if available & ROLE_ARN set
+# -----------------------------
+_session_cache: Dict[str, Any] = {"expires_at": 0, "creds": None}
 
-def _require(*pairs):
-    missing = [name for name, val in pairs if not val]
-    if missing:
-        raise HTTPException(500, detail=f"Missing env vars: {', '.join(missing)}")
+def _now_epoch() -> int:
+    return int(time.time())
 
-# ── LWA (refresh_token → access_token) ────────────────────────────────────────
-def get_lwa_access_token():
-    _require(
-        ("LWA_CLIENT_ID", LWA_CLIENT_ID),
-        ("LWA_CLIENT_SECRET", LWA_CLIENT_SECRET),
-        ("LWA_REFRESH_TOKEN", LWA_REFRESH_TOKEN),
-    )
+def _assume_role_if_configured():
+    """
+    If ROLE_ARN is set and boto3 is available, attempt to assume role.
+    Cache creds until they expire; otherwise fall back to static keys.
+    """
+    global _session_cache
+    if not ROLE_ARN:
+        return None
+
+    # Use cache if still valid (30s buffer)
+    if _session_cache["creds"] and _session_cache["expires_at"] - 30 > _now_epoch():
+        return _session_cache["creds"]
+
+    try:
+        import boto3  # type: ignore
+        sts = boto3.client(
+            "sts",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY,
+            aws_secret_access_key=AWS_SECRET_KEY,
+        )
+        resp = sts.assume_role(RoleArn=ROLE_ARN, RoleSessionName="chatzon-spapi-session")
+        creds = resp["Credentials"]
+        _session_cache["creds"] = {
+            "AccessKeyId": creds["AccessKeyId"],
+            "SecretAccessKey": creds["SecretAccessKey"],
+            "SessionToken": creds["SessionToken"],
+        }
+        _session_cache["expires_at"] = int(creds["Expiration"].timestamp())
+        return _session_cache["creds"]
+    except Exception as e:
+        # If boto3 not installed or assume_role fails, just return None to use base keys
+        return None
+
+# -----------------------------
+# LWA access token
+# -----------------------------
+def get_lwa_access_token() -> str:
+    """
+    Exchange LWA refresh token for an access token.
+    """
+    url = "https://api.amazon.com/auth/o2/token"
     data = {
         "grant_type": "refresh_token",
         "refresh_token": LWA_REFRESH_TOKEN,
         "client_id": LWA_CLIENT_ID,
         "client_secret": LWA_CLIENT_SECRET,
     }
-    r = requests.post("https://api.amazon.com/auth/o2/token", data=data, timeout=30)
+    r = requests.post(url, data=data, timeout=30)
     if r.status_code != 200:
-        raise HTTPException(400, detail={"status": r.status_code, "body": r.text})
+        raise RuntimeError(f"LWA token error {r.status_code}: {r.text}")
     return r.json()["access_token"]
 
-# ── SigV4 ─────────────────────────────────────────────────────────────────────
-def _sign(host: str, method: str, path: str, query: str, body_bytes: bytes, amz_date: str, date_stamp: str):
+# -----------------------------
+# SigV4 signing for SP-API (service execute-api)
+# -----------------------------
+def _sign(
+    method: str,
+    host: str,
+    region: str,
+    canonical_uri: str,
+    canonical_querystring: str,
+    headers: Dict[str, str],
+    payload: bytes,
+    aws_access_key: str,
+    aws_secret_key: str,
+    aws_session_token: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Create AWS SigV4 headers for SP-API (execute-api).
+    """
     service = "execute-api"
-    canonical_uri = path
-    canonical_querystring = query or ""
-    payload_hash = hashlib.sha256(body_bytes).hexdigest()
+    t = datetime.datetime.utcnow()
+    amz_date = t.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = t.strftime("%Y%m%d")
 
-    headers = {"host": host, "x-amz-date": amz_date}
-    signed_headers = "host;x-amz-date"
-    if AWS_SESSION_TOKEN:
-        headers["x-amz-security-token"] = AWS_SESSION_TOKEN
-        signed_headers = "host;x-amz-date;x-amz-security-token"
+    # Required headers
+    canonical_headers_items = {
+        "host": host,
+        "x-amz-date": amz_date,
+    }
+    # Merge caller headers (e.g., x-amz-access-token)
+    for k, v in headers.items():
+        canonical_headers_items[k.lower()] = v
 
-    canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
-    canonical_request = "\n".join([method, canonical_uri, canonical_querystring, canonical_headers, signed_headers, payload_hash])
+    signed_headers_list = sorted(canonical_headers_items.keys())
+    canonical_headers = "".join([f"{k}:{canonical_headers_items[k]}\n" for k in signed_headers_list])
+    signed_headers = ";".join(signed_headers_list)
+
+    payload_hash = hashlib.sha256(payload).hexdigest()
+    canonical_request = "\n".join(
+        [
+            method.upper(),
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers,
+            payload_hash,
+        ]
+    )
 
     algorithm = "AWS4-HMAC-SHA256"
-    credential_scope = f"{date_stamp}/{REGION}/{service}/aws4_request"
-    string_to_sign = "\n".join([algorithm, amz_date, credential_scope, hashlib.sha256(canonical_request.encode("utf-8")).hexdigest()])
+    credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = "\n".join(
+        [
+            algorithm,
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
+        ]
+    )
 
-    def _hmac(key, msg): return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-    k_date    = _hmac(("AWS4" + AWS_SECRET).encode("utf-8"), date_stamp)
-    k_region  = hmac.new(k_date, REGION.encode("utf-8"), hashlib.sha256).digest()
+    def _sign_hmac(key, msg):
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _sign_hmac(("AWS4" + aws_secret_key).encode("utf-8"), date_stamp)
+    k_region = hmac.new(k_date, region.encode("utf-8"), hashlib.sha256).digest()
     k_service = hmac.new(k_region, service.encode("utf-8"), hashlib.sha256).digest()
     k_signing = hmac.new(k_service, b"aws4_request", hashlib.sha256).digest()
     signature = hmac.new(k_signing, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
 
-    auth_header = (
-        f"{algorithm} Credential={AWS_KEY}/{credential_scope}, "
-        f"SignedHeaders={signed_headers}, Signature={signature}"
+    authorization_header = (
+        f"{algorithm} "
+        f"Credential={aws_access_key}/{credential_scope}, "
+        f"SignedHeaders={signed_headers}, "
+        f"Signature={signature}"
     )
-    return headers, auth_header
 
-def sp_api_request(method: str, path: str, *, params: dict | None = None, json_body: dict | None = None, access_token: str | None = None):
-    _require(("AWS_ACCESS_KEY_ID", AWS_KEY), ("AWS_SECRET_ACCESS_KEY", AWS_SECRET))
-    urlp = urlparse(SP_API_ENDPOINT)
-    host = urlp.netloc
-    query_str = urlencode(params or {}, doseq=True)
-    full_url = f"{SP_API_ENDPOINT}{path}" + (f"?{query_str}" if query_str else "")
+    out_headers = {
+        "x-amz-date": amz_date,
+        "Authorization": authorization_header,
+    }
+    if aws_session_token:
+        out_headers["x-amz-security-token"] = aws_session_token
+    return out_headers
 
-    # Only send Content-Type when body exists (Amazon can reject it on GET)
-    body_bytes = b""
-    headers_base = {"accept": "application/json"}
-    if json_body is not None:
-        body_bytes = json.dumps(json_body, separators=(",", ":")).encode("utf-8")
-        headers_base["content-type"] = "application/json; charset=UTF-8"
+def execute_signed_request(
+    method: str,
+    path: str,
+    query: Optional[Dict[str, Any]] = None,
+    body_json: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> requests.Response:
+    """
+    Execute a signed HTTP request to SP-API.
+    """
+    base_url = SP_API_ENDPOINT.rstrip("/")
+    url = f"{base_url}{path}"
+    host = base_url.replace("https://", "").replace("http://", "")
 
-    now = datetime.datetime.utcnow()
-    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    date_stamp = now.strftime("%Y%m%d")
+    # Querystring
+    canonical_querystring = urlencode(query or {}, doseq=True)
 
-    sig_headers, auth = _sign(host, method.upper(), path, query_str, body_bytes, amz_date, date_stamp)
+    # Body
+    payload_bytes = b""
+    headers = {"content-type": "application/json"}
+    if body_json is not None:
+        data_str = json.dumps(body_json, separators=(",", ":"), ensure_ascii=False)
+        payload_bytes = data_str.encode("utf-8")
+    else:
+        data_str = None
 
-    headers = {**headers_base, **sig_headers, "Authorization": auth}
-    if AWS_SESSION_TOKEN:
-        headers["x-amz-security-token"] = AWS_SESSION_TOKEN
-    if access_token:
-        headers["x-amz-access-token"] = access_token
+    # LWA access token
+    access_token = get_lwa_access_token()
+    headers["x-amz-access-token"] = access_token
 
-    resp = requests.request(method, full_url, headers=headers, data=body_bytes if body_bytes else None, timeout=60)
-    if resp.status_code >= 400:
-        raise HTTPException(resp.status_code, detail={"status": resp.status_code, "body": resp.text})
-    return resp
+    # Merge extra headers (if any)
+    if extra_headers:
+        headers.update(extra_headers)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+    # Credentials: prefer assumed role if possible
+    creds = _assume_role_if_configured()
+    if creds:
+        ak = creds["AccessKeyId"]
+        sk = creds["SecretAccessKey"]
+        st = creds.get("SessionToken")
+    else:
+        ak = AWS_ACCESS_KEY
+        sk = AWS_SECRET_KEY
+        st = None
+
+    # SigV4
+    signed = _sign(
+        method=method,
+        host=host,
+        region=AWS_REGION,
+        canonical_uri=path,
+        canonical_querystring=canonical_querystring,
+        headers={"x-amz-access-token": headers["x-amz-access-token"]},
+        payload=payload_bytes,
+        aws_access_key=ak,
+        aws_secret_key=sk,
+        aws_session_token=st,
+    )
+
+    # Final headers (include those signed + our originals)
+    final_headers = {**headers, **signed}
+
+    # Dispatch
+    if method.upper() == "GET":
+        return requests.get(url, headers=final_headers, params=query, timeout=60)
+    elif method.upper() == "POST":
+        return requests.post(url, headers=final_headers, params=query, data=data_str, timeout=60)
+    elif method.upper() == "PUT":
+        return requests.put(url, headers=final_headers, params=query, data=data_str, timeout=60)
+    elif method.upper() == "DELETE":
+        return requests.delete(url, headers=final_headers, params=query, data=data_str, timeout=60)
+    else:
+        raise ValueError(f"Unsupported method: {method}")
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+app = FastAPI(title="Chatzon Backend – Setup Check", version="2.1.0")
+
 @app.get("/health")
 def health():
-    return {"app": "Chatzon SP-API Bridge", "status": "ok", "time_utc": datetime.datetime.utcnow().isoformat()}
+    return {"ok": True, "service": "chatzon-backend", "time": datetime.datetime.utcnow().isoformat() + "Z"}
 
-@app.get("/diag/lwa")
-def diag_lwa():
-    token = get_lwa_access_token()
-    return {"status": 200, "access_token_prefix": token[:12] + "...", "expires_in": 3600}
-
-# ── Feeds helpers ─────────────────────────────────────────────────────────────
-def create_feed_document(access_token: str, content_type: str):
-    body = {"contentType": content_type}
-    r = sp_api_request("POST", "/feeds/2021-06-30/documents", json_body=body, access_token=access_token)
-    return r.json()
-
-def upload_feed_body(upload_url: str, data_bytes: bytes, content_type: str):
-    headers = {"Content-Type": content_type}
-    r = requests.put(upload_url, data=data_bytes, headers=headers, timeout=60)
-    if r.status_code not in (200, 201):
-        raise HTTPException(400, detail={"status": r.status_code, "body": r.text})
-
-def create_feed(access_token: str, marketplace_id: str, feed_document_id: str, feed_type: str):
-    body = {
-        "feedType": feed_type,
-        "marketplaceIds": [marketplace_id],
-        "inputFeedDocumentId": feed_document_id,
-    }
-    r = sp_api_request("POST", "/feeds/2021-06-30/feeds", json_body=body, access_token=access_token)
-    return r.json()
-
-# ── Price update via JSON_LISTINGS_FEED (optional) ────────────────────────────
-@app.post("/update-price-json")
-def update_price_json(payload: dict = Body(...)):
+@app.get("/check-setup")
+def check_setup():
     """
-    Body:
-    {
-      "sku": "YOUR-SKU",
-      "marketplaceId": "ATVPDKIKX0DER",
-      "amount": 20.99,
-      "currency": "USD",
-      "productType": "PRODUCT"
-    }
+    Calls /sellers/v1/marketplaceParticipations to verify:
+      - LWA token exchange works
+      - SigV4 signing works
+      - AWS creds/role are valid
+      - Endpoint/region/headers are correct
     """
-    token = get_lwa_access_token()
-    sku = payload["sku"]
-    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
-    amount = float(payload["amount"])
-    currency = payload.get("currency", "USD")
-    product_type = payload.get("productType", "PRODUCT")
-
-    # JSON Listings shape (purchasable_offer)
-    feed_json = {
-        "header": {"sellerId": SELLER_ID, "version": "2.0"},
-        "messages": [{
-            "messageId": 1,
-            "sku": sku,
-            "operationType": "UPDATE",
-            "productType": product_type,
-            "attributes": {
-                "purchasable_offer": [{
-                    "marketplace_id": marketplace_id,
-                    "currency": currency,
-                    "our_price": [{
-                        "schedule": [{
-                            "value_with_tax": {"amount": amount, "currency": currency}
-                        }]
-                    }]
-                }]
-            }
-        }]
-    }
-
-    doc = create_feed_document(token, "application/json; charset=UTF-8")
-    upload_feed_body(doc["url"], json.dumps(feed_json, separators=(",", ":")).encode("utf-8"), "application/json; charset=UTF-8")
-    feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "JSON_LISTINGS_FEED")
-    return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
-
-# ── Price update via legacy XML (recommended) ─────────────────────────────────
-def build_price_xml(sku: str, amount: float, currency: str) -> str:
-    # Minimal, widely accepted price update for POST_PRODUCT_PRICING_DATA
-    return f'''<?xml version="1.0" encoding="utf-8"?>
-<AmazonEnvelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="amzn-envelope.xsd">
-  <Header>
-    <DocumentVersion>1.01</DocumentVersion>
-    <MerchantIdentifier>{SELLER_ID or "UNKNOWN_SELLER"}</MerchantIdentifier>
-  </Header>
-  <MessageType>Price</MessageType>
-  <Message>
-    <MessageID>1</MessageID>
-    <OperationType>Update</OperationType>
-    <Price>
-      <SKU>{sku}</SKU>
-      <StandardPrice currency="{currency}">{amount:.2f}</StandardPrice>
-    </Price>
-  </Message>
-</AmazonEnvelope>'''.strip()
-
-@app.post("/update-price-xml")
-def update_price_xml(payload: dict = Body(...)):
-    """
-    Body:
-    {
-      "sku": "YOUR-SKU",
-      "marketplaceId": "ATVPDKIKX0DER",
-      "amount": 20.99,
-      "currency": "USD"
-    }
-    """
-    token = get_lwa_access_token()
-    sku = payload["sku"]
-    marketplace_id = payload.get("marketplaceId") or MARKETPLACE_ID
-    amount = float(payload["amount"])
-    currency = payload.get("currency", "USD")
-
-    xml_body = build_price_xml(sku, amount, currency)
-    # Use application/xml (text/xml can be picky)
-    doc = create_feed_document(token, "application/xml; charset=UTF-8")
-    upload_feed_body(doc["url"], xml_body.encode("utf-8"), "application/xml; charset=UTF-8")
-    feed = create_feed(token, marketplace_id, doc["feedDocumentId"], "POST_PRODUCT_PRICING_DATA")
-    return {"status": "submitted", "feedId": feed.get("feedId"), "feedDocumentId": doc.get("feedDocumentId")}
-
-# ── Feed tracking ─────────────────────────────────────────────────────────────
-@app.get("/feeds/recent")
-def list_recent_feeds(maxResults: int = 10, feedTypes: str = "POST_PRODUCT_PRICING_DATA,JSON_LISTINGS_FEED"):
-    """
-    Examples:
-      /feeds/recent?maxResults=10
-      /feeds/recent?maxResults=10&feedTypes=POST_PRODUCT_PRICING_DATA,JSON_LISTINGS_FEED
-    """
-    token = get_lwa_access_token()
-    types = [t.strip() for t in (feedTypes or "").split(",") if t.strip()]
-    # SP-API expects repeated feedTypes entries (not a single comma string)
-    params = {"maxResults": maxResults, "feedTypes": types}
-    r = sp_api_request("GET", "/feeds/2021-06-30/feeds", params=params, access_token=token)
-    return r.json()
-
-@app.get("/feed-status")
-def feed_status(feedId: str):
-    token = get_lwa_access_token()
-    r = sp_api_request("GET", f"/feeds/2021-06-30/feeds/{feedId}", access_token=token)
-    return r.json()
-
-@app.get("/feed-report-by-doc")
-def feed_report_by_doc(docId: str):
-    token = get_lwa_access_token()
-    r = sp_api_request("GET", f"/feeds/2021-06-30/documents/{docId}", access_token=token)
-    info = r.json()
-    url = info.get("url")
-    if not url:
-        raise HTTPException(400, detail={"errors": [{"message": "Invalid document id or no URL returned"}]})
-    dl = requests.get(url, timeout=60)
-    content = dl.content
-    # Reports may be gzipped
     try:
-        content = gzip.decompress(content)
-    except OSError:
-        pass
-    try:
-        return json.loads(content.decode("utf-8"))
-    except Exception:
-        return {"raw": content.decode("utf-8", errors="ignore")}
+        resp = execute_signed_request(
+            method="GET",
+            path="/sellers/v1/marketplaceParticipations",
+        )
+        content_type = resp.headers.get("content-type", "")
+        out: Dict[str, Any] = {
+            "status_code": resp.status_code,
+            "content_type": content_type,
+        }
+        try:
+            out["data"] = resp.json()
+        except Exception:
+            out["text"] = resp.text[:2000]
+        return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)},
+        )
