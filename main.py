@@ -549,3 +549,105 @@ def set_purchasable_offer(body: Dict[str, Any] = Body(..., example={
     except Exception: jr = {"text": resp.text}
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
+# === NEW: Quick link endpoint (secure GET) to change price ===
+from fastapi.responses import HTMLResponse
+import re
+
+QUICK_TOKEN = os.getenv("QUICK_TOKEN", "")  # set this in Railway
+
+@app.get("/quick/price", response_class=HTMLResponse)
+def quick_price(
+    token: str = Query(..., description="Shared secret"),
+    sku: str = Query(...),
+    amount: str = Query(..., description="e.g. 19.99 or $19.99"),
+    marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
+    requirements: str = Query("LISTING"),
+    itemCondition: str = Query("New"),
+):
+    if not QUICK_TOKEN or token != QUICK_TOKEN:
+        return HTMLResponse('<h3>Forbidden</h3><p>Bad or missing token.</p>', status_code=403)
+
+    # Parse amount like "$19.99"
+    m = re.sub(r"[^\d.]", "", str(amount))
+    if not m:
+        return HTMLResponse('<h3>Bad Request</h3><p>Invalid amount.</p>', status_code=400)
+    try:
+        amt = round(float(m), 2)
+    except Exception:
+        return HTMLResponse('<h3>Bad Request</h3><p>Invalid amount.</p>', status_code=400)
+
+    # Discover productType (fallback to PRODUCT)
+    insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
+                 query={"marketplaceIds": marketplaceId})
+    try: insp_json = insp.json()
+    except Exception: insp_json = {"text": insp.text}
+    pt = None
+    try:
+        for s in (insp_json.get("summaries") or []):
+            if s.get("marketplaceId")==marketplaceId and s.get("productType"):
+                pt=s["productType"]; break
+        if not pt and (insp_json.get("summaries") or []):
+            pt=insp_json["summaries"][0].get("productType")
+    except Exception:
+        pt=None
+    if not pt: pt="PRODUCT"
+
+    # PATCH purchasable_offer (controller for your DRINK_FLAVORED)
+    patch_body = {
+        "productType": pt,
+        "patches": [{
+            "op": "replace",
+            "path": "/attributes/purchasable_offer",
+            "value": [{
+                "audience": "ALL",
+                "marketplace_id": marketplaceId,
+                "currency": "USD",
+                "our_price": [{"schedule": [{"value_with_tax": amt}]}]
+            }]
+        }]
+    }
+    path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
+    q = {"marketplaceIds": marketplaceId, "requirements": requirements, "issueLocale":"en_US"}
+    p = _exec("PATCH", path, query=q, body=patch_body)
+    try: preply = p.json()
+    except Exception: preply = {"text": p.text}
+
+    # Read back authoritative price (Product Pricing API)
+    pr = _exec("GET", f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers",
+               query={"MarketplaceId": marketplaceId, "ItemCondition": itemCondition})
+    try: prb = pr.json()
+    except Exception: prb = {"text": pr.text}
+
+    # Try to show your offer price in the HTML
+    new_price = None
+    try:
+        offers = (prb.get("payload") or {}).get("Offers") or []
+        mine = next((o for o in offers if o.get("MyOffer")), offers[0] if offers else None)
+        if mine:
+            lp = (mine.get("BuyingPrice") or {}).get("ListingPrice") or mine.get("ListingPrice") or {}
+            if lp.get("Amount") is not None:
+                new_price = float(lp["Amount"])
+        if new_price is None:
+            bb = ((prb.get("payload") or {}).get("Summary") or {}).get("BuyBoxPrices") or []
+            if bb:
+                lpb = bb[0].get("ListingPrice") or {}
+                if lpb.get("Amount") is not None:
+                    new_price = float(lpb["Amount"])
+    except Exception:
+        pass
+
+    ok = (200 <= p.status_code < 300)
+    html = f"""
+    <html><body style="font-family:system-ui;padding:20px">
+      <h2>Quick Price Update</h2>
+      <p><b>SKU:</b> {sku}</p>
+      <p><b>Marketplace:</b> {marketplaceId}</p>
+      <p><b>Target:</b> ${amt:.2f}</p>
+      <p><b>Patch:</b> {"ACCEPTED" if ok else "FAILED"} (HTTP {p.status_code})</p>
+      <pre style="background:#f6f6f6;padding:10px;border-radius:8px;white-space:pre-wrap">{json.dumps(preply, indent=2)[:2000]}</pre>
+      <h3>Authoritative Offer Price</h3>
+      <p><b>Detected:</b> {"$"+format(new_price, ".2f") if new_price is not None else "unknown"}</p>
+      <pre style="background:#f6f6f6;padding:10px;border-radius:8px;white-space:pre-wrap">{json.dumps(prb, indent=2)[:2000]}</pre>
+    </body></html>
+    """
+    return HTMLResponse(html, status_code=200 if ok else (p.status_code if p.status_code<500 else 502))
