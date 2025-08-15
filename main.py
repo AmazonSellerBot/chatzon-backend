@@ -651,3 +651,16 @@ def quick_price(
     </body></html>
     """
     return HTMLResponse(html, status_code=200 if ok else (p.status_code if p.status_code<500 else 502))
+# --- Add near the other envs ---
+ACTION_TOKEN = os.getenv("ACTION_TOKEN", os.getenv("QUICK_TOKEN", ""))
+
+from fastapi import Request
+
+def _check_auth(request: Request):
+    if not ACTION_TOKEN:
+        return None  # unlocked (not recommended)
+    auth = request.headers.get("authorization", "")
+    expected = f"Bearer {ACTION_TOKEN}"
+    if auth != expected:
+        return JSONResponse(status_code=403, content={"error": "forbidden"})
+    return None
