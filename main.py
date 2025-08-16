@@ -181,7 +181,7 @@ def _check_auth(request: Request):
     return None
 
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="3.0.0")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="3.0.1")
 
 @app.get("/health")
 def health():
@@ -507,18 +507,21 @@ def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
 
 # 5b) Price update endpoint (ASYNC, returns immediately)
 @app.post("/update-price-fast")
-async def update_price_fast(request: Request, body: Dict[str, Any] = Body(..., example={
-    "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
-    "marketplaceId": "ATVPDKIKX0DER",
-    "currency": "USD",
-    "amount": 20.99
-}), bg: BackgroundTasks = None):
+async def update_price_fast(
+    request: Request,
+    body: Dict[str, Any] = Body(..., example={
+        "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
+        "marketplaceId": "ATVPDKIKX0DER",
+        "currency": "USD",
+        "amount": 20.99
+    }),
+    bg: BackgroundTasks = None
+):
     guard = _check_auth(request)
     if guard: return guard
 
     sku = body.get("sku")
-    marketplaceId = body.get("marketplaceId") or MARKPLACE_ID_DEFAULT if False else MARKPLACE_ID_DEFAULT  # guard type
-    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
+    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT  # ✅ fixed name
     currency = str(body.get("currency", "USD")).upper()
     amount = body.get("amount")
     if not (sku and marketplaceId and amount is not None):
@@ -532,7 +535,7 @@ async def update_price_fast(request: Request, body: Dict[str, Any] = Body(..., e
         bg.add_task(_run_price_update, job_id, {"sku": sku, "marketplaceId": marketplaceId, "currency": currency, "amount": amount})
     return {"status": "accepted", "jobId": job_id}
 
-# 6) Force standard_price (note: many productTypes reject this; yours did)
+# 6) Force standard_price
 @app.post("/set-standard-price")
 def set_standard_price(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
@@ -589,9 +592,9 @@ async def set_purchasable_offer(request: Request, body: Dict[str, Any] = Body(..
 
     sku = body.get("sku"); marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
     currency = str(body.get("currency", "USD")).upper(); amount = body.get("amount")
-    if not (sku and marketplaceId and amount is not None): 
+    if not (sku and marketplaceId and amount is not None):
         return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
-    if not SELLER_ID: 
+    if not SELLER_ID:
         return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
 
     job_id = str(uuid.uuid4())
