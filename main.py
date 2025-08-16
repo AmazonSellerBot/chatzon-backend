@@ -1,3 +1,10 @@
+# --- ADD THESE ---
+from fastapi import BackgroundTasks, Request
+import uuid, time, logging
+
+JOBS = {}  # in-memory tracker for async jobs
+log = logging.getLogger("chatzon")
+# --- END ADD ---
 # main.py
 # Chatzon Backend – Catalog + Listings + Price Update + Get Price (+ Auth Guard)
 # Routes:
