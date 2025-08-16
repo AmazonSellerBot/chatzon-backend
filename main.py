@@ -1,10 +1,3 @@
-# --- ADD THESE ---
-from fastapi import BackgroundTasks, Request
-import uuid, time, logging
-
-JOBS = {}  # in-memory tracker for async jobs
-log = logging.getLogger("chatzon")
-# --- END ADD ---
 # main.py
 # Chatzon Backend – Catalog + Listings + Price Update + Get Price (+ Auth Guard)
 # Routes:
@@ -13,17 +6,24 @@ log = logging.getLogger("chatzon")
 #   GET  /inspect-listing
 #   GET  /get-offer-price
 #   GET  /get-listing-price
-#   POST /update-price
-#   POST /update-price-fast  (alias)
+#   POST /update-price            (sync)
+#   POST /update-price-fast       (ASYNC - returns immediately with jobId)
 #   POST /set-standard-price
-#   POST /set-purchasable-offer
+#   POST /set-purchasable-offer   (ASYNC - returns immediately with jobId)
+#   GET  /feed-status             (check async job status)
 
-import os, hmac, hashlib, json, time, datetime
+import os, hmac, hashlib, json, time, datetime, uuid, logging
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlencode, quote
+
 import requests
-from fastapi import FastAPI, Body, Query, Request
+from fastapi import FastAPI, Body, Query, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
+
+# ---------- Async job tracker ----------
+JOBS: Dict[str, Dict[str, Any]] = {}   # {job_id: {"status": "...", "details": {...}}}
+log = logging.getLogger("chatzon")
+# --------------------------------------
 
 # ===== Env =====
 LWA_CLIENT_ID = os.getenv("LWA_CLIENT_ID", "")
@@ -181,7 +181,7 @@ def _check_auth(request: Request):
     return None
 
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="2.10.0")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="3.0.0")
 
 @app.get("/health")
 def health():
@@ -429,9 +429,43 @@ def _try_patch_price(sku: str, marketplaceId: str, currency: str, amount: float,
                 return {"ok": False, "req": req, "variant": idx, "http": resp.status_code, "amazon": jr, "sent": {"query": q, "body": body}}
     return {"ok": False, "http": 400, "amazon": {"errors": [{"code": "InvalidInput", "message": "Invalid parameters provided.", "details": ""}]}}
 
-# 5) Price update endpoints (alias)  ---- AUTH GUARD APPLIED ----
+# ---------- ASYNC WORKER ----------
+def _run_price_update(job_id: str, payload: Dict[str, Any]):
+    """Background task: inspects productType then tries the price patch."""
+    try:
+        sku = payload.get("sku")
+        marketplaceId = payload.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
+        currency = str(payload.get("currency", "USD")).upper()
+        amount = float(payload.get("amount"))
+
+        # Inspect to learn productType
+        insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
+                     query={"marketplaceIds": marketplaceId})
+        try: insp_json = insp.json()
+        except Exception: insp_json = {"text": insp.text}
+
+        pt = None
+        try:
+            for s in (insp_json.get("summaries") or []):
+                if s.get("marketplaceId") == marketplaceId and s.get("productType"):
+                    pt = s["productType"]; break
+            if not pt and (insp_json.get("summaries") or []):
+                pt = insp_json["summaries"][0].get("productType")
+        except Exception:
+            pt = None
+        if not pt:
+            pt = "PRODUCT"
+
+        result = _try_patch_price(sku, marketplaceId, currency, float(amount), pt)
+        JOBS[job_id]["status"] = "DONE" if result.get("ok") else "ERROR"
+        JOBS[job_id]["details"] = {"result": result}
+    except Exception as e:
+        JOBS[job_id]["status"] = "ERROR"
+        JOBS[job_id]["details"] = {"message": str(e)}
+# -----------------------------------
+
+# 5) Price update endpoint (SYNC)  ---- AUTH GUARD APPLIED ----
 @app.post("/update-price")
-@app.post("/update-price-fast")
 def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
@@ -450,6 +484,7 @@ def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     if not SELLER_ID:
         return JSONResponse(status_code=500, content={"error": "SPAPI_SELLER_ID not set"})
 
+    # Inline (blocking) version
     insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
                  query={"marketplaceIds": marketplaceId})
     try: insp_json = insp.json()
@@ -469,6 +504,33 @@ def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     result = _try_patch_price(sku, marketplaceId, currency, float(amount), pt)
     status = 200 if result.get("ok") else (result.get("http") or 400)
     return JSONResponse(status_code=status if status < 500 else 502, content={"result": result})
+
+# 5b) Price update endpoint (ASYNC, returns immediately)
+@app.post("/update-price-fast")
+async def update_price_fast(request: Request, body: Dict[str, Any] = Body(..., example={
+    "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
+    "marketplaceId": "ATVPDKIKX0DER",
+    "currency": "USD",
+    "amount": 20.99
+}), bg: BackgroundTasks = None):
+    guard = _check_auth(request)
+    if guard: return guard
+
+    sku = body.get("sku")
+    marketplaceId = body.get("marketplaceId") or MARKPLACE_ID_DEFAULT if False else MARKPLACE_ID_DEFAULT  # guard type
+    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
+    currency = str(body.get("currency", "USD")).upper()
+    amount = body.get("amount")
+    if not (sku and marketplaceId and amount is not None):
+        return JSONResponse(status_code=400, content={"error": "sku, marketplaceId, currency, amount are required"})
+    if not SELLER_ID:
+        return JSONResponse(status_code=500, content={"error": "SPAPI_SELLER_ID not set"})
+
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "ACCEPTED", "details": {"sku": sku, "amount": amount, "marketplaceId": marketplaceId}}
+    if bg is not None:
+        bg.add_task(_run_price_update, job_id, {"sku": sku, "marketplaceId": marketplaceId, "currency": currency, "amount": amount})
+    return {"status": "accepted", "jobId": job_id}
 
 # 6) Force standard_price (note: many productTypes reject this; yours did)
 @app.post("/set-standard-price")
@@ -513,56 +575,38 @@ def set_standard_price(request: Request, body: Dict[str, Any] = Body(..., exampl
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
 
-# 7) Force purchasable_offer (controller for your DRINK_FLAVORED)
+# 7) Purchasable offer (ASYNC wrapper so callers get a quick response)
 @app.post("/set-purchasable-offer")
-def set_purchasable_offer(request: Request, body: Dict[str, Any] = Body(..., example={
+async def set_purchasable_offer(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
     "currency": "USD",
     "amount": 20.99,
     "requirements": "LISTING"  # or LISTING_OFFER_ONLY
-})):
+}), bg: BackgroundTasks = None):
     guard = _check_auth(request)
     if guard: return guard
 
     sku = body.get("sku"); marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT
-    currency = str(body.get("currency", "USD")).upper(); amount = float(body.get("amount"))
-    requirements = body.get("requirements") or "LISTING_OFFER_ONLY"
-    if not (sku and marketplaceId and amount): return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
-    if not SELLER_ID: return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
+    currency = str(body.get("currency", "USD")).upper(); amount = body.get("amount")
+    if not (sku and marketplaceId and amount is not None): 
+        return JSONResponse(status_code=400, content={"error":"sku, marketplaceId, amount required"})
+    if not SELLER_ID: 
+        return JSONResponse(status_code=500, content={"error":"SPAPI_SELLER_ID not set"})
 
-    insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}", query={"marketplaceIds": marketplaceId})
-    try: insp_json = insp.json()
-    except Exception: insp_json = {"text": insp.text}
-    pt = None
-    try:
-        for s in (insp_json.get("summaries") or []):
-            if s.get("marketplaceId")==marketplaceId and s.get("productType"): pt=s["productType"]; break
-        if not pt and (insp_json.get("summaries") or []): pt=insp_json["summaries"][0].get("productType")
-    except Exception: pt=None
-    if not pt: pt="PRODUCT"
+    job_id = str(uuid.uuid4())
+    JOBS[job_id] = {"status": "ACCEPTED", "details": {"sku": sku, "amount": amount, "marketplaceId": marketplaceId, "requirements": body.get("requirements")}}
+    if bg is not None:
+        bg.add_task(_run_price_update, job_id, {"sku": sku, "marketplaceId": marketplaceId, "currency": currency, "amount": amount})
+    return {"status": "accepted", "jobId": job_id}
 
-    patch_body = {
-        "productType": pt,
-        "patches": [{
-            "op": "replace",
-            "path": "/attributes/purchasable_offer",
-            "value": [{
-                "audience": "ALL",
-                "marketplace_id": marketplaceId,
-                "currency": currency,
-                "our_price": [{
-                    "schedule": [{
-                        "value_with_tax": round(amount, 2)
-                    }]
-                }]
-            }]
-        }]
-    }
-    path = f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}"
-    q = {"marketplaceIds": marketplaceId, "requirements": requirements, "issueLocale":"en_US"}
-    resp = _exec("PATCH", path, query=q, body=patch_body)
-    try: jr = resp.json()
-    except Exception: jr = {"text": resp.text}
-    return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
-                        content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
+# 8) Check async job status
+@app.get("/feed-status")
+def feed_status(jobId: str, request: Request):
+    guard = _check_auth(request)
+    if guard: return guard
+
+    job = JOBS.get(jobId)
+    if not job:
+        return JSONResponse({"error": "job not found"}, status_code=404)
+    return {"jobId": jobId, **job}
