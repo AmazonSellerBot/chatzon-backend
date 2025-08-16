@@ -181,13 +181,13 @@ def _check_auth(request: Request):
     return None
 
 # ===== App =====
-app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="3.0.1")
+app = FastAPI(title="Chatzon Backend – Catalog+Listings+PriceUpdate", version="3.0.2")
 
 @app.get("/health")
 def health():
     return {"ok": True, "service": "chatzon-backend", "time": datetime.datetime.utcnow().isoformat()+"Z"}
 
-# 1) Catalog lookup by SKU (Amazon REQUIRES sellerId for SKU searches)
+# 1) Catalog lookup by SKU
 @app.get("/catalog-by-sku")
 def catalog_by_sku(sku: str = Query(...), marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT)):
     resp = _exec(
@@ -239,7 +239,7 @@ def inspect_listing(sku: str = Query(...), marketplaceId: str = Query(MARKETPLAC
 def get_offer_price(
     sku: str = Query(...),
     marketplaceId: str = Query(MARKETPLACE_ID_DEFAULT),
-    itemCondition: str = Query("New")  # New | Used | Collectible | Refurbished | Club
+    itemCondition: str = Query("New")
 ):
     path = f"/products/pricing/v0/listings/{quote(sku, safe='')}/offers"
     resp = _exec("GET", path, query={
@@ -297,7 +297,7 @@ def get_offer_price(
         out["raw"] = body
     return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
 
-# 4) Get current price from Listings Items attributes (may be empty for price)
+# 4) Get current price from Listings Items attributes
 @app.get("/get-listing-price")
 def get_listing_price(
     sku: str = Query(...),
@@ -381,7 +381,7 @@ def get_listing_price(
         out["raw_summary"] = body.get("summaries")
     return JSONResponse(status_code=resp.status_code if resp.status_code < 500 else 502, content=out)
 
-# --- Price helpers (two attribute paths + two requirement modes) ---
+# --- Price helpers ---
 def _bodies_for_price(currency: str, amount: float, productType: str) -> List[Dict[str, Any]]:
     amt = round(float(amount), 2)
     a = {
@@ -464,7 +464,7 @@ def _run_price_update(job_id: str, payload: Dict[str, Any]):
         JOBS[job_id]["details"] = {"message": str(e)}
 # -----------------------------------
 
-# 5) Price update endpoint (SYNC)  ---- AUTH GUARD APPLIED ----
+# 5) Price update endpoint (SYNC)
 @app.post("/update-price")
 def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
@@ -484,7 +484,6 @@ def update_price(request: Request, body: Dict[str, Any] = Body(..., example={
     if not SELLER_ID:
         return JSONResponse(status_code=500, content={"error": "SPAPI_SELLER_ID not set"})
 
-    # Inline (blocking) version
     insp = _exec("GET", f"/listings/2021-08-01/items/{SELLER_ID}/{quote(sku, safe='')}",
                  query={"marketplaceIds": marketplaceId})
     try: insp_json = insp.json()
@@ -521,7 +520,7 @@ async def update_price_fast(
     if guard: return guard
 
     sku = body.get("sku")
-    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT  # ✅ fixed name
+    marketplaceId = body.get("marketplaceId") or MARKETPLACE_ID_DEFAULT  # fixed
     currency = str(body.get("currency", "USD")).upper()
     amount = body.get("amount")
     if not (sku and marketplaceId and amount is not None):
@@ -578,14 +577,14 @@ def set_standard_price(request: Request, body: Dict[str, Any] = Body(..., exampl
     return JSONResponse(status_code=resp.status_code if resp.status_code<500 else 502,
                         content={"sent":{"query": q, "body": patch_body}, "amazon": jr})
 
-# 7) Purchasable offer (ASYNC wrapper so callers get a quick response)
+# 7) Purchasable offer (ASYNC wrapper)
 @app.post("/set-purchasable-offer")
 async def set_purchasable_offer(request: Request, body: Dict[str, Any] = Body(..., example={
     "sku": "ELECTRIC PICKLE JUICE-64 OZ-FBA",
     "marketplaceId": "ATVPDKIKX0DER",
     "currency": "USD",
     "amount": 20.99,
-    "requirements": "LISTING"  # or LISTING_OFFER_ONLY
+    "requirements": "LISTING"
 }), bg: BackgroundTasks = None):
     guard = _check_auth(request)
     if guard: return guard
